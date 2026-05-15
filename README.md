@@ -1,51 +1,57 @@
 # Badminton Court Booker
 
-Async Python Playwright automation for booking a badminton court on the Southampton Sport Gladstone Go site.
+Python Playwright automation for booking badminton courts on Southampton Sport Gladstone Go.
 
-The script logs in, searches for `Badminton`, picks the date exactly 8 days after the current `Europe/London` date, opens the available spaces page, and tries to book one slot in this order:
+## Production Rules
 
-1. `19:00 Jubilee Court 1`
-2. `19:00 Jubilee Court 2`
-3. `19:00 Jubilee Court 3`
-4. `19:00 Jubilee Court 4`
-5. `18:00 Jubilee Court 1`
-6. `18:00 Jubilee Court 2`
-7. `18:00 Jubilee Court 3`
-8. `18:00 Jubilee Court 4`
+- Target date = current `Europe/London` date + 8 days
+- Preferred order:
+  1. `19:00 Jubilee Court 1`
+  2. `19:00 Jubilee Court 2`
+  3. `19:00 Jubilee Court 3`
+  4. `19:00 Jubilee Court 4`
+  5. `18:00 Jubilee Court 1`
+  6. `18:00 Jubilee Court 2`
+  7. `18:00 Jubilee Court 3`
+  8. `18:00 Jubilee Court 4`
+- Stop after the first slot that reaches `Booking Confirmed!`
+- If a slot does not confirm, continue to the next preferred slot
+- `DRY_RUN=true` never clicks the final confirmation button
 
-`DRY_RUN=true` always stops before the final confirmation click. The script does not attempt to bypass CAPTCHA, MFA, verification pages, forbidden pages, or rate limits.
+The script does not bypass CAPTCHA, MFA, verification pages, forbidden pages, or rate limits.
 
-## Files
+## What A Git Clone Does Not Include
 
-- [book_badminton.py](book_badminton.py): main async Playwright program
-- [.env.example](.env.example): environment template
-- [requirements.txt](requirements.txt): Python dependencies
-- [tests/test_booking_helpers.py](tests/test_booking_helpers.py): unit tests for date and priority logic
-- [deploy/badminton-booking.service](deploy/badminton-booking.service): systemd service template
-- [deploy/badminton-booking.timer](deploy/badminton-booking.timer): systemd timer template
+A downloaded clone does not include local secrets or machine setup:
 
-## Quick Start From A Fresh Clone
+- `.env`
+- `.venv/`
+- `logs/`
+- `screenshots/`
+- local `cron`
+- local `systemd` installation
 
-If you downloaded or cloned this repo onto a new Ubuntu machine:
+Each user must complete local setup on their own Ubuntu machine.
+
+## Quick Start
+
+Clone the repo:
 
 ```bash
 git clone <YOUR_GITHUB_REPO_URL> badminton
 cd badminton
 ```
 
-Then create the Python environment and install dependencies.
-
-## Local Setup
-
-Create the virtual environment and install Python dependencies:
+Create the environment and install dependencies:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python -m playwright install --with-deps chromium
 ```
 
-If Ubuntu reports that `ensurepip` or `venv` is missing, install the OS package first and then recreate the venv:
+If Ubuntu says `venv` is missing:
 
 ```bash
 sudo apt-get update
@@ -53,34 +59,16 @@ sudo apt-get install -y python3-venv
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-Install Playwright Chromium and its Ubuntu dependencies:
-
-```bash
-source .venv/bin/activate
 python -m playwright install --with-deps chromium
 ```
 
-That command typically prompts for `sudo` because Playwright installs required system libraries.
-
-## Configuration
-
-Create `.env` from `.env.example`:
+Create `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Required secrets:
-
-```dotenv
-BOOKING_URL=https://soton.gladstonego.cloud/account
-GYM_USERNAME=your-email@example.com
-GYM_PASSWORD=your-password
-```
-
-Production `.env` shape for unattended Ubuntu execution:
+Recommended production `.env`:
 
 ```dotenv
 BOOKING_URL=https://soton.gladstonego.cloud/account
@@ -95,48 +83,24 @@ PREFERRED_TIMES=19:00,18:00
 PREFERRED_COURTS=1,2,3,4
 ```
 
-Notes:
+Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_SECONDS` empty in production.
 
-- Leave `TARGET_DATE_OVERRIDE` empty in production. It is only for debug/testing.
-- Leave `DEBUG_PAUSE_SECONDS` empty in production.
-- Credentials should only be stored in `.env`.
+## Configuration Notes
 
-## Parameter Reference
+- `TIMEZONE`: keep `Europe/London` in production
+- `HEADLESS=true`: run without a visible browser
+- `DRY_RUN=true`: safe test mode, never confirms a booking
+- `PREFERRED_TIMES`: comma-separated times, e.g. `19:00,18:00`
+- `PREFERRED_COURTS`: comma-separated court numbers, e.g. `1,2,3,4`
 
-The script is configured entirely through `.env`.
-
-- `BOOKING_URL`
-  - Gladstone Go account URL. Leave as `https://soton.gladstonego.cloud/account` unless the site changes.
-- `GYM_USERNAME`
-  - Login email for the Southampton Sport account.
-- `GYM_PASSWORD`
-  - Login password for the Southampton Sport account.
-- `TIMEZONE`
-  - Timezone used for computing the booking date. Production should stay `Europe/London`.
-- `HEADLESS`
-  - `true` runs without opening a visible browser window. Use `true` for unattended runs.
-- `DRY_RUN`
-  - `true` stops before the final booking confirmation. `false` performs the real booking attempt.
-- `TARGET_DATE_OVERRIDE`
-  - Optional debug-only date override. Leave empty in production.
-  - Supported formats: `YYYY-MM-DD` and `DD/MM/YYYY`.
-- `DEBUG_PAUSE_SECONDS`
-  - Optional debug-only pause after the booking page is reached. Leave empty in production.
-- `PREFERRED_TIMES`
-  - Comma-separated list of preferred start times in 24-hour format, for example `19:00,18:00`.
-- `PREFERRED_COURTS`
-  - Comma-separated list of preferred court numbers, for example `1,2,3,4`.
-
-The slot order is generated by combining `PREFERRED_TIMES` with `PREFERRED_COURTS` in time-first order.
-
-For example:
+These two settings:
 
 ```dotenv
 PREFERRED_TIMES=19:00,18:00
 PREFERRED_COURTS=1,2,3,4
 ```
 
-produces this booking priority:
+produce this order:
 
 1. `19:00 Jubilee Court 1`
 2. `19:00 Jubilee Court 2`
@@ -147,22 +111,16 @@ produces this booking priority:
 7. `18:00 Jubilee Court 3`
 8. `18:00 Jubilee Court 4`
 
-The script stops as soon as one slot reaches the `Booking Confirmed!` page. If a slot does not confirm successfully, the script continues to the next preferred slot in order.
+## Manual Runs
 
-## Dry Run
-
-Dry-run mode walks through the booking flow and stops before the final confirmation click:
+Dry run:
 
 ```bash
 source .venv/bin/activate
 DRY_RUN=true HEADLESS=false python book_badminton.py
 ```
 
-If you need to test selectors against a different day, set `TARGET_DATE_OVERRIDE` temporarily in `.env` or inline for that run only. Remove it again before production.
-
-## Real Run
-
-To perform the final confirmation click:
+Real run:
 
 ```bash
 source .venv/bin/activate
@@ -171,143 +129,99 @@ HEADLESS=true DRY_RUN=false python book_badminton.py
 
 ## Verification
 
-Run the unit tests:
-
 ```bash
 source .venv/bin/activate
 python -m pytest -q
-```
-
-Syntax-check the main script:
-
-```bash
-source .venv/bin/activate
 python -m py_compile book_badminton.py
 ```
 
-## Logs And Screenshots
+## Ubuntu Scheduling
 
-- Log files are written under `logs/`
-- Screenshots are written under `screenshots/`
-- The browser is always closed in a `finally` block
-
-If the site presents CAPTCHA, MFA, forbidden pages, verification pages, or rate limiting, the script stops, saves a screenshot, logs the error, and exits.
-
-## Ubuntu Deployment
-
-The deployment files in `deploy/` assume the repo lives at `/home/<YOUR_USERNAME>/badminton`.
-
-1. Edit your `.env` for production:
-
-```dotenv
-HEADLESS=true
-DRY_RUN=false
-TIMEZONE=Europe/London
-PREFERRED_TIMES=19:00,18:00
-PREFERRED_COURTS=1,2,3,4
-TARGET_DATE_OVERRIDE=
-DEBUG_PAUSE_SECONDS=
-```
-
-2. Replace `<YOUR_USERNAME>` inside the unit file:
-
-```bash
-sed -i "s|<YOUR_USERNAME>|$USER|g" deploy/badminton-booking.service
-```
-
-3. Copy the unit files into `/etc/systemd/system/`:
-
-```bash
-sudo cp deploy/badminton-booking.service /etc/systemd/system/
-sudo cp deploy/badminton-booking.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-```
-
-4. Enable and start the timer:
-
-```bash
-sudo systemctl enable --now badminton-booking.timer
-```
-
-The timer is configured for `00:00:00 Europe/London` every day so the booking run starts at midnight London time.
-
-## Cron Alternative
-
-If you prefer a simple per-user scheduler instead of `systemd`, add this to your user crontab:
+Recommended: `cron`
 
 ```bash
 crontab -e
 ```
+
+Add:
 
 ```cron
 CRON_TZ=Europe/London
 0 0 * * * cd /home/<YOUR_USERNAME>/badminton && /usr/bin/flock -n /tmp/badminton-booking.lock /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/book_badminton.py >> /home/<YOUR_USERNAME>/badminton/logs/cron-run.log 2>&1
 ```
 
-This runs the script every day at `00:00` London time and avoids overlapping runs with `flock`.
+This runs every day at `00:00` London time and prevents overlapping runs.
 
-## Manual Service Test
-
-Run the service once on demand:
+Check it:
 
 ```bash
-sudo systemctl start badminton-booking.service
-sudo systemctl status badminton-booking.service
+crontab -l
 ```
 
-You can also run the script directly before enabling the timer:
+Alternative: `systemd`
+
+Templates are in `deploy/`.
 
 ```bash
-source .venv/bin/activate
-DRY_RUN=true HEADLESS=false python book_badminton.py
+sed -i "s|<YOUR_USERNAME>|$USER|g" deploy/badminton-booking.service
+sudo cp deploy/badminton-booking.service /etc/systemd/system/
+sudo cp deploy/badminton-booking.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now badminton-booking.timer
 ```
 
-## Timer And Logs
+The timer runs every day at `00:00:00 Europe/London`.
 
-Inspect the timer schedule:
+## Logs
+
+- Logs are written under `logs/`
+- Screenshots are written under `screenshots/`
+- The browser is closed at the end of every run
+
+Useful commands:
 
 ```bash
-systemctl list-timers badminton-booking.timer --all
-systemctl status badminton-booking.timer
+tail -f logs/cron-run.log
+ls -lt logs | head
 ```
 
-Follow service logs:
+If using `systemd`:
 
 ```bash
 journalctl -u badminton-booking.service -n 200
 journalctl -u badminton-booking.service -f
 ```
 
-Repo-local logs and screenshots are also saved under `logs/` and `screenshots/`.
+## For Any AI Assistant
 
-## What A New Machine Needs
+This repo does not depend on any specific AI tool. A local assistant such as Claude, Codex, or another AI tool should be able to deploy it by following this order:
 
-If someone else downloads this repository onto another Ubuntu machine, they still need to do local setup. The repo alone is not enough.
+1. inspect the repo
+2. create `.venv`
+3. install `requirements.txt`
+4. run `python -m playwright install --with-deps chromium`
+5. create `.env` from `.env.example`
+6. verify with `pytest` and `py_compile`
+7. configure either `cron` or `systemd`
 
-They must:
+## Files
 
-1. Create their own `.env` from `.env.example`
-2. Add their own Southampton Sport username and password
-3. Create `.venv`
-4. Install Python packages from `requirements.txt`
-5. Install Playwright Chromium with `python -m playwright install --with-deps chromium`
-6. Enable either the `systemd` timer or the `cron` job
-
-No Codex-specific setup is required for normal operation. Codex is only useful if they want help debugging or changing the automation.
+- [book_badminton.py](book_badminton.py): main script
+- [.env.example](.env.example): environment template
+- [requirements.txt](requirements.txt): Python dependencies
+- [tests/test_booking_helpers.py](tests/test_booking_helpers.py): unit tests
+- [deploy/badminton-booking.service](deploy/badminton-booking.service): optional `systemd` service template
+- [deploy/badminton-booking.timer](deploy/badminton-booking.timer): optional `systemd` timer template
 
 ## Selector Maintenance
 
-Do not execute `recorded_flow.py` as part of production automation. If selectors drift, use it only as reference and capture a fresh Playwright recording:
+Do not execute `recorded_flow.py` in production. Use it only as selector reference.
+
+If selectors drift, capture a fresh Playwright recording:
 
 ```bash
 source .venv/bin/activate
 python -m playwright codegen https://soton.gladstonego.cloud/account
 ```
 
-Compare the fresh recording against the helper functions in [book_badminton.py](book_badminton.py):
-
-- `login(page, config, logger)`
-- `open_booking_search(page, config, logger)`
-- `search_badminton(page, target_date, config, logger)`
-- `open_available_spaces(page, target_date, config, logger)`
-- `try_book_slot(page, start_time, court_number, config, logger)`
+Then compare the new flow against the helper functions in [book_badminton.py](book_badminton.py).
