@@ -1,0 +1,17 @@
+[Unit]
+Description=Southampton Sport badminton booking
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=<YOUR_USERNAME>
+WorkingDirectory=/home/<YOUR_USERNAME>/badminton
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/<YOUR_USERNAME>
+ExecStart=/home/<YOUR_USERNAME>/badminton/.venv/bin/python /home/<YOUR_USERNAME>/badminton/book_badminton.py
+TimeoutStartSec=10min
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run badminton booking at midnight Europe/London
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 Europe/London
+AccuracySec=1s
+Persistent=true
+Unit=badminton-booking.service
+
+[Install]
+WantedBy=timers.target
