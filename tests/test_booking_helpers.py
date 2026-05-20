@@ -3,6 +3,7 @@ from datetime import date, datetime
 from book_badminton import (
     booking_confirmation_detected,
     SlotPreference,
+    build_preferred_starting_from_display_label,
     build_slot_priority,
     compute_target_date,
     build_available_spaces_button_pattern,
@@ -13,9 +14,11 @@ from book_badminton import (
     format_time_for_button_label,
     is_book_page_url,
     parse_target_date_override,
+    pick_starting_from_select_value,
     post_login_success_detected,
     pick_best_available_slot,
     resolve_target_date,
+    slot_card_text_matches,
 )
 
 
@@ -147,6 +150,27 @@ def test_build_slot_card_pattern_matches_court_and_time_range_text():
     assert not pattern.search("Jubilee Court 3 14:00 - 15:00 Thu 21st May Book now")
 
 
+def test_slot_card_text_matches_requires_exact_time_range_for_slot():
+    slot = SlotPreference(start_time="19:00", court_number=1)
+
+    assert slot_card_text_matches(
+        "Jubilee Court 1 19:00 - 20:00 Thu 28th May This slot is unavailable",
+        slot,
+    )
+    assert not slot_card_text_matches(
+        "Jubilee Court 1 07:00 - 08:00 Thu 28th May Book now",
+        slot,
+    )
+
+
+def test_build_slot_button_pattern_does_not_confuse_7pm_with_7am():
+    slot = SlotPreference(start_time="19:00", court_number=1)
+    pattern = build_slot_button_pattern(slot)
+
+    assert not pattern.search("Book now: for Jubilee Court 1 at  7:00 AM Thursday, May 28, 2026")
+    assert pattern.search("Book now: for Jubilee Court 1 at  7:00 PM Thursday, May 28, 2026")
+
+
 def test_build_available_spaces_button_pattern_matches_target_day_not_hard_coded():
     target_date = datetime.fromisoformat("2026-05-22T12:00:00").date()
     pattern = build_available_spaces_button_pattern(target_date)
@@ -225,3 +249,48 @@ def test_booking_confirmation_detected_rejects_calendar_unavailable_text():
         current_url="https://soton.gladstonego.cloud/book/calendar/HIFCASBADM1?activityDate=2026-05-21T06:00:00.000Z",
         body_text=body_text,
     )
+
+
+def test_pick_starting_from_select_value_prefers_starting_now_when_present():
+    options = [
+        ("0", "Starting now", False),
+        ("1", "From 01:00", False),
+        ("2", "From 02:00", False),
+    ]
+
+    assert pick_starting_from_select_value(options) == "0"
+
+
+def test_build_preferred_starting_from_display_label_uses_earliest_preferred_time():
+    assert build_preferred_starting_from_display_label(["19:00", "18:00"]) == "From 18:00"
+
+
+def test_pick_starting_from_select_value_prefers_configured_evening_filter_when_available():
+    options = [
+        ("0", "Starting now", False),
+        ("18", "From 18:00", False),
+        ("19", "From 19:00", False),
+    ]
+
+    assert pick_starting_from_select_value(options, preferred_times=["19:00", "18:00"]) == "18"
+
+
+def test_pick_starting_from_select_value_prefers_midnight_style_label_when_present():
+    options = [
+        ("", "Starting from", False),
+        ("00", "From 00:00", False),
+        ("01", "From 01:00", False),
+    ]
+
+    assert pick_starting_from_select_value(options) == "00"
+
+
+def test_pick_starting_from_select_value_falls_back_to_first_enabled_option():
+    options = [
+        ("", "Starting from", False),
+        ("0", "Any time", True),
+        ("1", "From 01:00", False),
+        ("2", "From 02:00", False),
+    ]
+
+    assert pick_starting_from_select_value(options) == "1"

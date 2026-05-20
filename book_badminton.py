@@ -100,6 +100,59 @@ def parse_optional_int(value: str | None, default: int = 0) -> int:
     return max(parsed, 0)
 
 
+def normalize_visible_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def sort_clock_times(times: Sequence[str]) -> list[str]:
+    return sorted(dict.fromkeys(time.strip() for time in times if time.strip()), key=lambda value: datetime.strptime(value, "%H:%M"))
+
+
+def build_preferred_starting_from_labels(preferred_times: Sequence[str]) -> list[str]:
+    return [normalize_visible_text(f"From {time_value}") for time_value in sort_clock_times(preferred_times)]
+
+
+def build_preferred_starting_from_display_label(preferred_times: Sequence[str]) -> str:
+    sorted_times = sort_clock_times(preferred_times)
+    if sorted_times:
+        return f"From {sorted_times[0]}"
+    return "From 0:00"
+
+
+def pick_starting_from_select_value(
+    options: Sequence[tuple[str, str, bool]],
+    preferred_times: Sequence[str] = (),
+) -> str | None:
+    first_enabled_value: str | None = None
+    desired_labels = build_preferred_starting_from_labels(preferred_times)
+    normalized_to_value: dict[str, str] = {}
+
+    for value, label, disabled in options:
+        if disabled:
+            continue
+
+        normalized_label = normalize_visible_text(label or value)
+        if not normalized_label:
+            continue
+        if normalized_label in {"starting from", "select", "please select", "choose"}:
+            continue
+
+        if first_enabled_value is None:
+            first_enabled_value = value
+
+        normalized_to_value.setdefault(normalized_label, value)
+
+    for desired_label in desired_labels:
+        if desired_label in normalized_to_value:
+            return normalized_to_value[desired_label]
+
+    for zero_label in ("starting now", "from 0:00", "from 00:00", "0:00", "00:00"):
+        if zero_label in normalized_to_value:
+            return normalized_to_value[zero_label]
+
+    return first_enabled_value
+
+
 def compute_target_date(
     now: datetime | None = None,
     timezone_name: str = DEFAULT_TIMEZONE,
@@ -188,6 +241,16 @@ def build_slot_card_pattern(slot: SlotPreference) -> re.Pattern[str]:
         rf"{re.escape(time_range)}.*Jubilee Court {slot.court_number}",
         re.IGNORECASE | re.DOTALL,
     )
+
+
+def slot_card_text_matches(card_text: str, slot: SlotPreference) -> bool:
+    normalized = normalize_visible_text(card_text)
+    if not normalized:
+        return False
+
+    court_label = normalize_visible_text(f"Jubilee Court {slot.court_number}")
+    time_range = normalize_visible_text(format_slot_time_range(slot.start_time))
+    return court_label in normalized and time_range in normalized
 
 
 def build_final_confirmation_pattern() -> re.Pattern[str]:
@@ -528,27 +591,79 @@ async def open_booking_search(page: Page, config: AppConfig, logger: logging.Log
     logger.info("Booking search page opened.")
 
 
-async def try_select_starting_from(page: Page, logger: logging.Logger) -> None:
+async def try_select_starting_from(
+    page: Page,
+    preferred_times: Sequence[str],
+    logger: logging.Logger,
+) -> None:
     starting_from = page.get_by_label(re.compile(r"starting from", re.I)).first
     await starting_from.wait_for(state="visible")
+    preferred_labels = build_preferred_starting_from_labels(preferred_times)
+    target_label = build_preferred_starting_from_display_label(preferred_times)
+
+    tag_name = (await starting_from.evaluate("(el) => el.tagName")).lower()
+    if tag_name == "select":
+        raw_options = await starting_from.evaluate(
+            """
+            (el) => Array.from(el.options).map((option) => ({
+                value: option.value,
+                label: (option.label || option.textContent || "").trim(),
+                disabled: option.disabled,
+            }))
+            """
+        )
+        option_tuples = [
+            (
+                str(option.get("value", "")),
+                str(option.get("label", "")),
+                bool(option.get("disabled", False)),
+            )
+            for option in raw_options
+        ]
+        selected_value = pick_starting_from_select_value(option_tuples, preferred_times=preferred_times)
+        if selected_value is None:
+            raise RuntimeError("Could not determine a usable 'Starting from' select option.")
+
+        await starting_from.select_option(value=selected_value)
+        logger.info(
+            "Selected 'Starting from' using native select value %r for preferred times %s.",
+            selected_value,
+            ", ".join(preferred_times),
+        )
+        return
 
     try:
-        await starting_from.select_option(label="From 0:00")
-        logger.info("Selected 'From 0:00' using select_option.")
+        await starting_from.select_option(label=target_label)
+        logger.info("Selected '%s' using select_option.", target_label)
         return
     except PlaywrightError:
         pass
 
     await starting_from.click()
-    option = page.get_by_role("option", name=re.compile(r"from 0:00", re.I)).first
-    if await option.count():
-        await option.click()
-        logger.info("Selected 'From 0:00' using option click.")
+    option_patterns = [re.compile(re.escape(label), re.IGNORECASE) for label in preferred_labels]
+    option_patterns.extend(
+        [
+            re.compile(r"starting now", re.IGNORECASE),
+            re.compile(r"from 0:00", re.IGNORECASE),
+            re.compile(r"from 00:00", re.IGNORECASE),
+        ]
+    )
+    for pattern in option_patterns:
+        option = page.get_by_role("option", name=pattern).first
+        if await option.count():
+            await option.click()
+            logger.info("Selected 'Starting from' option using option click pattern %r.", pattern.pattern)
+            return
+
+    is_text_entry = await starting_from.evaluate(
+        "(el) => ['INPUT', 'TEXTAREA'].includes(el.tagName) || el.isContentEditable"
+    )
+    if is_text_entry:
+        await starting_from.fill(target_label)
+        logger.info("Filled 'Starting from' as text fallback with %s.", target_label)
         return
 
-    # TODO: update this if codegen shows the site uses a custom combobox widget.
-    await starting_from.fill("From 0:00")
-    logger.info("Filled 'Starting from' as text fallback.")
+    raise RuntimeError("Could not set the 'Starting from' control using any supported strategy.")
 
 
 async def close_calendar_overlay(page: Page, logger: logging.Logger) -> None:
@@ -783,13 +898,38 @@ async def wait_for_available_spaces_content(
 
 
 async def find_slot_card(page: Page, slot: SlotPreference) -> Locator | None:
-    card_pattern = build_slot_card_pattern(slot)
-    candidates = page.locator("article, section, li, div").filter(has_text=card_pattern)
-    count = await candidates.count()
-    for index in range(count):
-        candidate = candidates.nth(index)
-        if await is_visible(candidate):
-            return candidate
+    candidate_sets = (
+        page.locator(".activity-calendar-timetable-slot"),
+        page.locator("[data-qa-id^='slot-']"),
+        page.locator("article, section, li"),
+    )
+
+    best_candidate: Locator | None = None
+    best_text_length: int | None = None
+
+    for candidates in candidate_sets:
+        count = await candidates.count()
+        for index in range(count):
+            candidate = candidates.nth(index)
+            if not await is_visible(candidate):
+                continue
+
+            try:
+                candidate_text = await candidate.inner_text()
+            except PlaywrightError:
+                continue
+
+            if not slot_card_text_matches(candidate_text, slot):
+                continue
+
+            candidate_text_length = len(normalize_visible_text(candidate_text))
+            if best_text_length is None or candidate_text_length < best_text_length:
+                best_candidate = candidate
+                best_text_length = candidate_text_length
+
+        if best_candidate is not None:
+            return best_candidate
+
     return None
 
 
@@ -810,7 +950,7 @@ async def search_badminton(
     await page.get_by_role("option", name="Select Badminton option").click()
 
     await set_target_date(page, target_date, logger)
-    await try_select_starting_from(page, logger)
+    await try_select_starting_from(page, config.preferred_times, logger)
 
     search_button = page.get_by_role("button", name="Search for activities")
     await search_button.click()
