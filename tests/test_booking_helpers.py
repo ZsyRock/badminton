@@ -5,6 +5,7 @@ from book_badminton import (
     SlotPreference,
     build_preferred_starting_from_display_label,
     build_slot_priority,
+    compute_target_date_after_next_local_midnight,
     compute_target_date,
     build_available_spaces_button_pattern,
     build_slot_card_pattern,
@@ -18,7 +19,9 @@ from book_badminton import (
     post_login_success_detected,
     pick_best_available_slot,
     resolve_target_date,
+    seconds_until_next_local_midnight,
     slot_card_text_matches,
+    should_use_midnight_prewarm,
 )
 
 
@@ -70,6 +73,45 @@ def test_resolve_target_date_uses_default_rule_when_override_missing():
 
     assert resolved == date(2026, 5, 22)
     assert using_override is False
+
+
+def test_seconds_until_next_local_midnight_uses_london_clock():
+    seconds = seconds_until_next_local_midnight(
+        timezone_name="Europe/London",
+        now=datetime.fromisoformat("2026-05-24T22:59:30+00:00"),
+    )
+
+    assert seconds == 30.0
+
+
+def test_should_use_midnight_prewarm_only_in_short_window_before_midnight():
+    assert should_use_midnight_prewarm(
+        timezone_name="Europe/London",
+        target_date_override=None,
+        now=datetime.fromisoformat("2026-05-24T22:59:30+00:00"),
+    )
+    assert not should_use_midnight_prewarm(
+        timezone_name="Europe/London",
+        target_date_override=None,
+        now=datetime.fromisoformat("2026-05-24T22:55:00+00:00"),
+    )
+
+
+def test_should_use_midnight_prewarm_is_disabled_by_target_date_override():
+    assert not should_use_midnight_prewarm(
+        timezone_name="Europe/London",
+        target_date_override="2026-06-01",
+        now=datetime.fromisoformat("2026-05-24T22:59:30+00:00"),
+    )
+
+
+def test_compute_target_date_after_next_local_midnight_uses_post_midnight_day():
+    resolved = compute_target_date_after_next_local_midnight(
+        timezone_name="Europe/London",
+        now=datetime.fromisoformat("2026-05-24T22:59:30+00:00"),
+    )
+
+    assert resolved == date(2026, 6, 2)
 
 
 def test_format_date_for_site_returns_dd_mm_yyyy():

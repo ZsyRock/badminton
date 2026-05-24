@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Iterable, Sequence
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,7 @@ BLOCKER_PATTERNS = (
     "too many requests",
     "verify you are human",
 )
+MIDNIGHT_PREWARM_WINDOW_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,55 @@ def compute_target_date(
         reference = reference.replace(tzinfo=timezone.utc)
     local_now = reference.astimezone(zone)
     return local_now.date() + timedelta(days=8)
+
+
+def get_local_now(
+    timezone_name: str = DEFAULT_TIMEZONE,
+    now: datetime | None = None,
+) -> datetime:
+    zone = ZoneInfo(timezone_name)
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(zone)
+
+
+def seconds_until_next_local_midnight(
+    timezone_name: str = DEFAULT_TIMEZONE,
+    now: datetime | None = None,
+) -> float:
+    local_now = get_local_now(timezone_name, now=now)
+    next_midnight = datetime.combine(
+        local_now.date() + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=local_now.tzinfo,
+    )
+    return max((next_midnight - local_now).total_seconds(), 0.0)
+
+
+def should_use_midnight_prewarm(
+    timezone_name: str,
+    target_date_override: str | None,
+    now: datetime | None = None,
+    prewarm_window_seconds: int = MIDNIGHT_PREWARM_WINDOW_SECONDS,
+) -> bool:
+    if target_date_override:
+        return False
+    seconds_until_midnight = seconds_until_next_local_midnight(timezone_name, now=now)
+    return 0 < seconds_until_midnight <= prewarm_window_seconds
+
+
+def compute_target_date_after_next_local_midnight(
+    timezone_name: str = DEFAULT_TIMEZONE,
+    now: datetime | None = None,
+) -> date:
+    local_now = get_local_now(timezone_name, now=now)
+    next_midnight = datetime.combine(
+        local_now.date() + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=local_now.tzinfo,
+    )
+    return compute_target_date(now=next_midnight, timezone_name=timezone_name)
 
 
 def parse_target_date_override(value: str | None) -> date | None:
@@ -942,6 +993,16 @@ async def search_badminton(
     formatted_date = format_date_for_site(target_date)
     logger.info("Searching for Badminton on %s", formatted_date)
 
+    await prepare_badminton_search_form(page, target_date, config, logger)
+    await submit_badminton_search(page, config, logger)
+
+
+async def prepare_badminton_search_form(
+    page: Page,
+    target_date: date,
+    config: AppConfig,
+    logger: logging.Logger,
+) -> None:
     activity_field = get_activity_textbox(page)
 
     await activity_field.wait_for(state="visible")
@@ -952,6 +1013,12 @@ async def search_badminton(
     await set_target_date(page, target_date, logger)
     await try_select_starting_from(page, config.preferred_times, logger)
 
+
+async def submit_badminton_search(
+    page: Page,
+    config: AppConfig,
+    logger: logging.Logger,
+) -> None:
     search_button = page.get_by_role("button", name="Search for activities")
     await search_button.click()
     await page.wait_for_load_state("networkidle")
@@ -1181,9 +1248,15 @@ async def book_best_available_slot(
     page: Page,
     config: AppConfig,
     logger: logging.Logger,
+    booking_flow_started_at: float | None = None,
 ) -> BookingAttemptResult | None:
     logger.info("Checking preferred slots in priority order.")
     visible_slots = await list_visible_bookable_slots(page, config.slot_priority)
+    if booking_flow_started_at is not None:
+        logger.info(
+            "Timing | login page open -> preferred slot availability resolved: %.2fs",
+            perf_counter() - booking_flow_started_at,
+        )
     if visible_slots:
         logger.info("Currently bookable preferred slots: %s", ", ".join(visible_slots))
     else:
@@ -1215,17 +1288,33 @@ async def run_booking() -> int:
     logger, log_path = setup_logging(config.timezone_name)
     logger.info("Log file: %s", log_path)
     logger.info("HEADLESS=%s DRY_RUN=%s TIMEZONE=%s", config.headless, config.dry_run, config.timezone_name)
-
-    target_date, using_override = resolve_target_date(
+    prewarm_mode = should_use_midnight_prewarm(
         timezone_name=config.timezone_name,
         target_date_override=config.target_date_override,
     )
-    if using_override:
-        logger.warning(
-            "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
-            format_date_for_site(target_date),
+    target_date: date | None = None
+    using_override = False
+    planned_target_date: date | None = None
+    if prewarm_mode:
+        planned_target_date = compute_target_date_after_next_local_midnight(config.timezone_name)
+        logger.info(
+            "Midnight prewarm mode is active. The script will log in before midnight and submit the search just after the London date rolls over."
         )
-    logger.info("Target booking date is %s", format_date_for_site(target_date))
+        logger.info(
+            "Planned post-midnight target booking date is %s",
+            format_date_for_site(planned_target_date),
+        )
+    else:
+        target_date, using_override = resolve_target_date(
+            timezone_name=config.timezone_name,
+            target_date_override=config.target_date_override,
+        )
+        if using_override:
+            logger.warning(
+                "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
+                format_date_for_site(target_date),
+            )
+        logger.info("Target booking date is %s", format_date_for_site(target_date))
     logger.info(
         "Slot priority: %s",
         ", ".join(slot.label for slot in config.slot_priority),
@@ -1244,11 +1333,69 @@ async def run_booking() -> int:
             )
             page = await context.new_page()
 
+            booking_flow_started_at = perf_counter()
             await login(page, config, logger)
+            logger.info(
+                "Timing | login page open -> login complete: %.2fs",
+                perf_counter() - booking_flow_started_at,
+            )
             await open_booking_search(page, config, logger)
-            await search_badminton(page, target_date, config, logger)
+            if prewarm_mode:
+                assert planned_target_date is not None
+                logger.info(
+                    "Prewarming the booking search form for %s before midnight.",
+                    format_date_for_site(planned_target_date),
+                )
+                await prepare_badminton_search_form(page, planned_target_date, config, logger)
+                seconds_until_midnight = seconds_until_next_local_midnight(config.timezone_name)
+                if seconds_until_midnight > 0:
+                    logger.info(
+                        "Midnight prewarm mode is waiting %.2fs before submitting the search.",
+                        seconds_until_midnight,
+                    )
+                    wait_started_at = perf_counter()
+                    await page.wait_for_timeout(int(seconds_until_midnight * 1000))
+                    logger.info(
+                        "Timing | midnight prewarm wait before search: %.2fs",
+                        perf_counter() - wait_started_at,
+                    )
+                target_date, using_override = resolve_target_date(
+                    timezone_name=config.timezone_name,
+                    target_date_override=config.target_date_override,
+                )
+                if using_override:
+                    logger.warning(
+                        "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
+                        format_date_for_site(target_date),
+                    )
+                logger.info("Target booking date is %s", format_date_for_site(target_date))
+                if target_date != planned_target_date:
+                    logger.warning(
+                        "Post-midnight target date changed from prewarmed %s to %s. Updating the search form before submitting.",
+                        format_date_for_site(planned_target_date),
+                        format_date_for_site(target_date),
+                    )
+                    await prepare_badminton_search_form(page, target_date, config, logger)
+                await submit_badminton_search(page, config, logger)
+            else:
+                assert target_date is not None
+                await search_badminton(page, target_date, config, logger)
+            logger.info(
+                "Timing | login page open -> search submitted: %.2fs",
+                perf_counter() - booking_flow_started_at,
+            )
+            assert target_date is not None
             await open_available_spaces(page, target_date, config, logger)
-            booking_result = await book_best_available_slot(page, config, logger)
+            logger.info(
+                "Timing | login page open -> available spaces page opened: %.2fs",
+                perf_counter() - booking_flow_started_at,
+            )
+            booking_result = await book_best_available_slot(
+                page,
+                config,
+                logger,
+                booking_flow_started_at=booking_flow_started_at,
+            )
 
             if booking_result:
                 if booking_result.outcome == "dry-run":
