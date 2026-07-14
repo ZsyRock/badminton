@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
@@ -36,6 +36,11 @@ BLOCKER_PATTERNS = (
     "verify you are human",
 )
 MIDNIGHT_PREWARM_WINDOW_SECONDS = 120
+ACCOUNT_A_KEY = "account_a"
+ACCOUNT_B_KEY = "account_b"
+ACCOUNT_A_LABEL = "账号A"
+ACCOUNT_B_LABEL = "账号B"
+SUCCESSFUL_BOOKING_OUTCOMES = {"confirmed", "dry-run"}
 
 
 @dataclass(frozen=True)
@@ -49,27 +54,44 @@ class SlotPreference:
 
 
 @dataclass(frozen=True)
-class AppConfig:
-    booking_url: str
+class BookingAccountConfig:
+    key: str
+    label: str
     username: str
     password: str
+    search_window_times: tuple[str, ...]
+    court_priority: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    booking_url: str
     timezone_name: str
     headless: bool
     dry_run: bool
     debug_pause_seconds: int
     target_date_override: str | None
-    preferred_times: tuple[str, ...]
-    preferred_courts: tuple[int, ...]
-
-    @property
-    def slot_priority(self) -> list[SlotPreference]:
-        return build_slot_priority(self.preferred_times, self.preferred_courts)
+    accounts: tuple[BookingAccountConfig, ...]
 
 
 @dataclass(frozen=True)
 class BookingAttemptResult:
     slot: SlotPreference
     outcome: str
+
+
+@dataclass
+class BookingCoordinator:
+    expected_accounts: int
+    initial_phase_results: dict[str, BookingAttemptResult | None] = field(default_factory=dict)
+    follow_up_times_by_account: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    follow_up_ready: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class AccountLoggerAdapter(logging.LoggerAdapter):
+    def process(self, msg: str, kwargs: dict[str, object]) -> tuple[str, dict[str, object]]:
+        return f"[{self.extra['account_label']}] {msg}", kwargs
 
 
 def parse_bool(value: str | None, default: bool) -> bool:
@@ -351,6 +373,13 @@ def build_slot_priority(
     return slots
 
 
+def build_account_slot_priority(
+    account: BookingAccountConfig,
+    preferred_times: Sequence[str],
+) -> list[SlotPreference]:
+    return build_slot_priority(preferred_times, account.court_priority)
+
+
 def pick_best_available_slot(
     available_slot_labels: Iterable[str],
     preferences: Sequence[SlotPreference],
@@ -360,6 +389,61 @@ def pick_best_available_slot(
         if slot.label.lower() in available:
             return slot
     return None
+
+
+def booking_attempt_succeeded(result: BookingAttemptResult | None) -> bool:
+    return result is not None and result.outcome in SUCCESSFUL_BOOKING_OUTCOMES
+
+
+def get_initial_attempt_times(account_key: str) -> tuple[str, ...]:
+    if account_key == ACCOUNT_A_KEY:
+        return ("19:00",)
+    if account_key == ACCOUNT_B_KEY:
+        return ("20:00",)
+    raise ValueError(f"Unsupported account key: {account_key}")
+
+
+def resolve_follow_up_times_by_account(
+    initial_success_by_account: dict[str, bool],
+) -> dict[str, tuple[str, ...]]:
+    account_a_success = initial_success_by_account.get(ACCOUNT_A_KEY, False)
+    account_b_success = initial_success_by_account.get(ACCOUNT_B_KEY, False)
+
+    if account_a_success and account_b_success:
+        return {
+            ACCOUNT_A_KEY: (),
+            ACCOUNT_B_KEY: (),
+        }
+    if not account_a_success and account_b_success:
+        return {
+            ACCOUNT_A_KEY: ("21:00",),
+            ACCOUNT_B_KEY: (),
+        }
+    if account_a_success and not account_b_success:
+        return {
+            ACCOUNT_A_KEY: (),
+            ACCOUNT_B_KEY: ("18:00",),
+        }
+    return {
+        ACCOUNT_A_KEY: ("18:00",),
+        ACCOUNT_B_KEY: ("21:00",),
+    }
+
+
+def get_required_search_window_times(account_key: str) -> tuple[str, ...]:
+    if account_key == ACCOUNT_A_KEY:
+        return ("18:00", "19:00", "21:00")
+    if account_key == ACCOUNT_B_KEY:
+        return ("18:00", "20:00", "21:00")
+    raise ValueError(f"Unsupported account key: {account_key}")
+
+
+def build_search_window_times(
+    account_key: str,
+    configured_times: Sequence[str],
+) -> tuple[str, ...]:
+    merged_times = list(configured_times) + list(get_required_search_window_times(account_key))
+    return tuple(sort_clock_times(merged_times))
 
 
 def booking_confirmation_detected(current_url: str, body_text: str) -> bool:
@@ -384,41 +468,96 @@ def booking_confirmation_detected(current_url: str, body_text: str) -> bool:
     return False
 
 
+def build_account_config(
+    *,
+    key: str,
+    label: str,
+    username: str,
+    password: str,
+    search_window_times: Sequence[str],
+    court_priority: Sequence[int],
+) -> BookingAccountConfig:
+    normalized_username = username.strip()
+    normalized_password = password.strip()
+    if not normalized_username:
+        raise ValueError(f"{label} username is required in .env")
+    if not normalized_password:
+        raise ValueError(f"{label} password is required in .env")
+
+    return BookingAccountConfig(
+        key=key,
+        label=label,
+        username=normalized_username,
+        password=normalized_password,
+        search_window_times=build_search_window_times(key, search_window_times),
+        court_priority=tuple(court_priority),
+    )
+
+
 def load_config() -> AppConfig:
     load_dotenv(dotenv_path=ENV_FILE)
     booking_url = os.getenv("BOOKING_URL", DEFAULT_BOOKING_URL).strip() or DEFAULT_BOOKING_URL
-    username = os.getenv("GYM_USERNAME", "").strip()
-    password = os.getenv("GYM_PASSWORD", "").strip()
     timezone_name = os.getenv("TIMEZONE", DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
     headless = parse_bool(os.getenv("HEADLESS"), default=False)
     dry_run = parse_bool(os.getenv("DRY_RUN"), default=True)
     debug_pause_seconds = parse_optional_int(os.getenv("DEBUG_PAUSE_SECONDS"), default=0)
     target_date_override = os.getenv("TARGET_DATE_OVERRIDE", "").strip() or None
-    preferred_times = parse_csv_strings(
+    primary_search_window_times = parse_csv_strings(
         os.getenv("PREFERRED_TIMES"),
-        default=("19:00", "18:00"),
+        default=("18:00", "19:00", "21:00"),
     )
-    preferred_courts = parse_csv_ints(
+    primary_court_priority = parse_csv_ints(
         os.getenv("PREFERRED_COURTS"),
-        default=(1, 2, 3, 4),
+        default=(4, 3, 2, 1),
     )
+    accounts = [
+        build_account_config(
+            key=ACCOUNT_A_KEY,
+            label=ACCOUNT_A_LABEL,
+            username=os.getenv("GYM_USERNAME", ""),
+            password=os.getenv("GYM_PASSWORD", ""),
+            search_window_times=primary_search_window_times,
+            court_priority=primary_court_priority,
+        )
+    ]
 
-    if not username:
-        raise ValueError("GYM_USERNAME is required in .env")
-    if not password:
-        raise ValueError("GYM_PASSWORD is required in .env")
+    secondary_username = os.getenv("SECONDARY_GYM_USERNAME", "")
+    secondary_password = os.getenv("SECONDARY_GYM_PASSWORD", "")
+    secondary_enabled_default = bool(
+        secondary_username.strip() or secondary_password.strip()
+    )
+    secondary_enabled = parse_bool(
+        os.getenv("SECONDARY_BOOKING_ENABLED"),
+        default=secondary_enabled_default,
+    )
+    if secondary_enabled:
+        secondary_search_window_times = parse_csv_strings(
+            os.getenv("SECONDARY_PREFERRED_TIMES"),
+            default=("18:00", "20:00", "21:00"),
+        )
+        secondary_court_priority = parse_csv_ints(
+            os.getenv("SECONDARY_PREFERRED_COURTS"),
+            default=(4, 3, 2, 1),
+        )
+        accounts.append(
+            build_account_config(
+                key=ACCOUNT_B_KEY,
+                label=ACCOUNT_B_LABEL,
+                username=secondary_username,
+                password=secondary_password,
+                search_window_times=secondary_search_window_times,
+                court_priority=secondary_court_priority,
+            )
+        )
 
     return AppConfig(
         booking_url=booking_url,
-        username=username,
-        password=password,
         timezone_name=timezone_name,
         headless=headless,
         dry_run=dry_run,
         debug_pause_seconds=debug_pause_seconds,
         target_date_override=target_date_override,
-        preferred_times=preferred_times,
-        preferred_courts=preferred_courts,
+        accounts=tuple(accounts),
     )
 
 
@@ -589,7 +728,12 @@ async def wait_for_booking_entrypoint(
     raise PlaywrightTimeoutError("Timed out waiting for a valid post-login booking entrypoint.")
 
 
-async def login(page: Page, config: AppConfig, logger: logging.Logger) -> None:
+async def login(
+    page: Page,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+) -> None:
     login_url = derive_login_url(config.booking_url)
     logger.info("Opening login page: %s", login_url)
     await page.goto(login_url, wait_until="domcontentloaded")
@@ -603,13 +747,13 @@ async def login(page: Page, config: AppConfig, logger: logging.Logger) -> None:
         logger.info("Already logged in and at a booking entrypoint.")
         return
 
-    logger.info("Logging in as %s", config.username)
+    logger.info("Logging in as %s", account.username)
     username_input = page.get_by_placeholder("Enter your email")
     password_input = page.get_by_placeholder("Enter your password")
 
     await username_input.wait_for(state="visible")
-    await username_input.fill(config.username)
-    await password_input.fill(config.password)
+    await username_input.fill(account.username)
+    await password_input.fill(account.password)
     submit_button = page.get_by_role("button", name="Login", exact=True)
     await submit_button.click()
     await page.wait_for_load_state("networkidle")
@@ -828,6 +972,7 @@ async def set_target_date(
 async def log_available_spaces_diagnostics(
     page: Page,
     config: AppConfig,
+    account: BookingAccountConfig,
     logger: logging.Logger,
 ) -> None:
     logger.info("Available spaces page URL: %s", page.url)
@@ -854,16 +999,16 @@ async def log_available_spaces_diagnostics(
     else:
         logger.info("No visible buttons were detected on the available spaces page.")
 
-    keywords = (
+    keywords = [
         "Jubilee Court",
         "Book now",
         "This slot is unavailable",
         "Available to book from",
-        "18:00",
-        "19:00",
-        "6:00 PM",
-        "7:00 PM",
-    )
+    ]
+    for preferred_time in account.search_window_times:
+        keywords.append(preferred_time)
+        keywords.append(format_time_for_button_label(preferred_time))
+        keywords.append(format_slot_time_range(preferred_time))
     try:
         body_text = await page.locator("body").inner_text()
     except PlaywrightError as exc:
@@ -888,7 +1033,7 @@ async def log_available_spaces_diagnostics(
     if config.dry_run:
         await save_named_screenshot(
             page,
-            "available-spaces",
+            f"{account.label}-available-spaces",
             config.timezone_name,
             logger,
         )
@@ -988,12 +1133,13 @@ async def search_badminton(
     page: Page,
     target_date: date,
     config: AppConfig,
+    account: BookingAccountConfig,
     logger: logging.Logger,
 ) -> None:
     formatted_date = format_date_for_site(target_date)
     logger.info("Searching for Badminton on %s", formatted_date)
 
-    await prepare_badminton_search_form(page, target_date, config, logger)
+    await prepare_badminton_search_form(page, target_date, config, account, logger)
     await submit_badminton_search(page, config, logger)
 
 
@@ -1001,6 +1147,7 @@ async def prepare_badminton_search_form(
     page: Page,
     target_date: date,
     config: AppConfig,
+    account: BookingAccountConfig,
     logger: logging.Logger,
 ) -> None:
     activity_field = get_activity_textbox(page)
@@ -1011,7 +1158,7 @@ async def prepare_badminton_search_form(
     await page.get_by_role("option", name="Select Badminton option").click()
 
     await set_target_date(page, target_date, logger)
-    await try_select_starting_from(page, config.preferred_times, logger)
+    await try_select_starting_from(page, account.search_window_times, logger)
 
 
 async def submit_badminton_search(
@@ -1030,6 +1177,7 @@ async def open_available_spaces(
     page: Page,
     target_date: date,
     config: AppConfig,
+    account: BookingAccountConfig,
     logger: logging.Logger,
 ) -> None:
     logger.info("Opening available spaces for %s", format_date_for_site(target_date))
@@ -1050,7 +1198,7 @@ async def open_available_spaces(
     await check_for_access_blockers(page, config, logger)
     await wait_for_available_spaces_content(page, config, logger)
     logger.info("Available spaces page opened.")
-    await log_available_spaces_diagnostics(page, config, logger)
+    await log_available_spaces_diagnostics(page, config, account, logger)
 
 
 async def get_visible_slot_button(page: Page, slot: SlotPreference) -> Locator | None:
@@ -1148,6 +1296,7 @@ async def wait_for_booking_confirmation_page(
     page: Page,
     slot: SlotPreference,
     config: AppConfig,
+    account: BookingAccountConfig,
     logger: logging.Logger,
     timeout_ms: int = 20_000,
 ) -> bool:
@@ -1172,7 +1321,7 @@ async def wait_for_booking_confirmation_page(
     await log_post_confirmation_state(page, slot, logger)
     await save_named_screenshot(
         page,
-        f"missing-confirmation-{slot.start_time}-court-{slot.court_number}",
+        f"{account.label}-missing-confirmation-{slot.start_time}-court-{slot.court_number}",
         config.timezone_name,
         logger,
     )
@@ -1206,6 +1355,7 @@ async def try_book_slot(
     start_time: str,
     court_number: int,
     config: AppConfig,
+    account: BookingAccountConfig,
     logger: logging.Logger,
 ) -> str | None:
     slot = SlotPreference(start_time=start_time, court_number=court_number)
@@ -1236,7 +1386,13 @@ async def try_book_slot(
         await page.wait_for_load_state("networkidle", timeout=5_000)
     except PlaywrightTimeoutError:
         logger.info("Network did not reach idle promptly after confirming %s; continuing to wait for confirmation page.", slot.label)
-    confirmation_detected = await wait_for_booking_confirmation_page(page, slot, config, logger)
+    confirmation_detected = await wait_for_booking_confirmation_page(
+        page,
+        slot,
+        config,
+        account,
+        logger,
+    )
     if confirmation_detected:
         return "confirmed"
 
@@ -1247,11 +1403,18 @@ async def try_book_slot(
 async def book_best_available_slot(
     page: Page,
     config: AppConfig,
+    account: BookingAccountConfig,
     logger: logging.Logger,
+    preferences: Sequence[SlotPreference],
+    phase_name: str,
     booking_flow_started_at: float | None = None,
 ) -> BookingAttemptResult | None:
-    logger.info("Checking preferred slots in priority order.")
-    visible_slots = await list_visible_bookable_slots(page, config.slot_priority)
+    if not preferences:
+        logger.info("No slot preferences were configured for the %s phase.", phase_name)
+        return None
+
+    logger.info("Checking %s slots in priority order.", phase_name)
+    visible_slots = await list_visible_bookable_slots(page, preferences)
     if booking_flow_started_at is not None:
         logger.info(
             "Timing | login page open -> preferred slot availability resolved: %.2fs",
@@ -1262,13 +1425,20 @@ async def book_best_available_slot(
     else:
         logger.info("No preferred slots appear bookable from the current page state.")
 
-    planned_slot = pick_best_available_slot(visible_slots, config.slot_priority)
+    planned_slot = pick_best_available_slot(visible_slots, preferences)
     if planned_slot is not None:
-        logger.info("Best currently available preferred slot: %s", planned_slot.label)
+        logger.info("Best currently available %s slot: %s", phase_name, planned_slot.label)
 
     last_unconfirmed_slot: SlotPreference | None = None
-    for slot in config.slot_priority:
-        outcome = await try_book_slot(page, slot.start_time, slot.court_number, config, logger)
+    for slot in preferences:
+        outcome = await try_book_slot(
+            page,
+            slot.start_time,
+            slot.court_number,
+            config,
+            account,
+            logger,
+        )
         if outcome == "unconfirmed":
             last_unconfirmed_slot = slot
             logger.warning(
@@ -1283,11 +1453,43 @@ async def book_best_available_slot(
     return None
 
 
-async def run_booking() -> int:
-    config = load_config()
-    logger, log_path = setup_logging(config.timezone_name)
-    logger.info("Log file: %s", log_path)
-    logger.info("HEADLESS=%s DRY_RUN=%s TIMEZONE=%s", config.headless, config.dry_run, config.timezone_name)
+def get_account_logger(
+    base_logger: logging.Logger,
+    account: BookingAccountConfig,
+) -> AccountLoggerAdapter:
+    return AccountLoggerAdapter(base_logger, {"account_label": account.label})
+
+
+async def record_initial_phase_result(
+    coordinator: BookingCoordinator,
+    account_key: str,
+    result: BookingAttemptResult | None,
+) -> None:
+    async with coordinator.lock:
+        if account_key not in coordinator.initial_phase_results:
+            coordinator.initial_phase_results[account_key] = result
+
+        if (
+            len(coordinator.initial_phase_results) == coordinator.expected_accounts
+            and not coordinator.follow_up_ready.is_set()
+        ):
+            coordinator.follow_up_times_by_account = resolve_follow_up_times_by_account(
+                {
+                    key: booking_attempt_succeeded(value)
+                    for key, value in coordinator.initial_phase_results.items()
+                }
+            )
+            coordinator.follow_up_ready.set()
+
+
+async def run_account_booking(
+    browser,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    base_logger: logging.Logger,
+    coordinator: BookingCoordinator,
+) -> int:
+    logger = get_account_logger(base_logger, account)
     prewarm_mode = should_use_midnight_prewarm(
         timezone_name=config.timezone_name,
         target_date_override=config.target_date_override,
@@ -1295,6 +1497,8 @@ async def run_booking() -> int:
     target_date: date | None = None
     using_override = False
     planned_target_date: date | None = None
+
+    logger.info("HEADLESS=%s DRY_RUN=%s TIMEZONE=%s", config.headless, config.dry_run, config.timezone_name)
     if prewarm_mode:
         planned_target_date = compute_target_date_after_next_local_midnight(config.timezone_name)
         logger.info(
@@ -1315,112 +1519,132 @@ async def run_booking() -> int:
                 format_date_for_site(target_date),
             )
         logger.info("Target booking date is %s", format_date_for_site(target_date))
-    logger.info(
-        "Slot priority: %s",
-        ", ".join(slot.label for slot in config.slot_priority),
-    )
-
-    browser = None
     context = None
     page = None
+    initial_phase_recorded = False
 
-    async with async_playwright() as playwright:
-        try:
-            browser = await playwright.chromium.launch(headless=config.headless)
-            context = await browser.new_context(
-                locale="en-GB",
-                timezone_id=config.timezone_name,
-            )
-            page = await context.new_page()
+    try:
+        context = await browser.new_context(
+            locale="en-GB",
+            timezone_id=config.timezone_name,
+        )
+        page = await context.new_page()
 
-            booking_flow_started_at = perf_counter()
-            await login(page, config, logger)
+        booking_flow_started_at = perf_counter()
+        await login(page, config, account, logger)
+        logger.info(
+            "Timing | login page open -> login complete: %.2fs",
+            perf_counter() - booking_flow_started_at,
+        )
+        await open_booking_search(page, config, logger)
+        if prewarm_mode:
+            assert planned_target_date is not None
             logger.info(
-                "Timing | login page open -> login complete: %.2fs",
-                perf_counter() - booking_flow_started_at,
+                "Prewarming the booking search form for %s before midnight.",
+                format_date_for_site(planned_target_date),
             )
-            await open_booking_search(page, config, logger)
-            if prewarm_mode:
-                assert planned_target_date is not None
+            await prepare_badminton_search_form(page, planned_target_date, config, account, logger)
+            seconds_until_midnight = seconds_until_next_local_midnight(config.timezone_name)
+            if seconds_until_midnight > 0:
                 logger.info(
-                    "Prewarming the booking search form for %s before midnight.",
+                    "Midnight prewarm mode is waiting %.2fs before submitting the search.",
+                    seconds_until_midnight,
+                )
+                wait_started_at = perf_counter()
+                await page.wait_for_timeout(int(seconds_until_midnight * 1000))
+                logger.info(
+                    "Timing | midnight prewarm wait before search: %.2fs",
+                    perf_counter() - wait_started_at,
+                )
+            target_date, using_override = resolve_target_date(
+                timezone_name=config.timezone_name,
+                target_date_override=config.target_date_override,
+            )
+            if using_override:
+                logger.warning(
+                    "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
+                    format_date_for_site(target_date),
+                )
+            logger.info("Target booking date is %s", format_date_for_site(target_date))
+            if target_date != planned_target_date:
+                logger.warning(
+                    "Post-midnight target date changed from prewarmed %s to %s. Updating the search form before submitting.",
                     format_date_for_site(planned_target_date),
+                    format_date_for_site(target_date),
                 )
-                await prepare_badminton_search_form(page, planned_target_date, config, logger)
-                seconds_until_midnight = seconds_until_next_local_midnight(config.timezone_name)
-                if seconds_until_midnight > 0:
-                    logger.info(
-                        "Midnight prewarm mode is waiting %.2fs before submitting the search.",
-                        seconds_until_midnight,
-                    )
-                    wait_started_at = perf_counter()
-                    await page.wait_for_timeout(int(seconds_until_midnight * 1000))
-                    logger.info(
-                        "Timing | midnight prewarm wait before search: %.2fs",
-                        perf_counter() - wait_started_at,
-                    )
-                target_date, using_override = resolve_target_date(
-                    timezone_name=config.timezone_name,
-                    target_date_override=config.target_date_override,
-                )
-                if using_override:
-                    logger.warning(
-                        "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
-                        format_date_for_site(target_date),
-                    )
-                logger.info("Target booking date is %s", format_date_for_site(target_date))
-                if target_date != planned_target_date:
-                    logger.warning(
-                        "Post-midnight target date changed from prewarmed %s to %s. Updating the search form before submitting.",
-                        format_date_for_site(planned_target_date),
-                        format_date_for_site(target_date),
-                    )
-                    await prepare_badminton_search_form(page, target_date, config, logger)
-                await submit_badminton_search(page, config, logger)
-            else:
-                assert target_date is not None
-                await search_badminton(page, target_date, config, logger)
-            logger.info(
-                "Timing | login page open -> search submitted: %.2fs",
-                perf_counter() - booking_flow_started_at,
-            )
+                await prepare_badminton_search_form(page, target_date, config, account, logger)
+            await submit_badminton_search(page, config, logger)
+        else:
             assert target_date is not None
-            await open_available_spaces(page, target_date, config, logger)
+            await search_badminton(page, target_date, config, account, logger)
+        logger.info(
+            "Timing | login page open -> search submitted: %.2fs",
+            perf_counter() - booking_flow_started_at,
+        )
+        assert target_date is not None
+        await open_available_spaces(page, target_date, config, account, logger)
+        logger.info(
+            "Timing | login page open -> available spaces page opened: %.2fs",
+            perf_counter() - booking_flow_started_at,
+        )
+        initial_phase_preferences = build_account_slot_priority(
+            account,
+            get_initial_attempt_times(account.key),
+        )
+        logger.info(
+            "Initial booking phase targets: %s",
+            ", ".join(slot.label for slot in initial_phase_preferences),
+        )
+        booking_result = await book_best_available_slot(
+            page,
+            config,
+            account,
+            logger,
+            preferences=initial_phase_preferences,
+            phase_name="initial",
+            booking_flow_started_at=booking_flow_started_at,
+        )
+        await record_initial_phase_result(coordinator, account.key, booking_result)
+        initial_phase_recorded = True
+        await coordinator.follow_up_ready.wait()
+
+        follow_up_times = coordinator.follow_up_times_by_account.get(account.key, ())
+        if follow_up_times and not booking_attempt_succeeded(booking_result):
+            follow_up_preferences = build_account_slot_priority(account, follow_up_times)
             logger.info(
-                "Timing | login page open -> available spaces page opened: %.2fs",
-                perf_counter() - booking_flow_started_at,
+                "Follow-up booking phase targets: %s",
+                ", ".join(slot.label for slot in follow_up_preferences),
             )
-            booking_result = await book_best_available_slot(
+            follow_up_result = await book_best_available_slot(
                 page,
                 config,
+                account,
                 logger,
-                booking_flow_started_at=booking_flow_started_at,
+                preferences=follow_up_preferences,
+                phase_name="follow-up",
             )
+            if follow_up_result is not None:
+                booking_result = follow_up_result
+        elif booking_attempt_succeeded(booking_result):
+            logger.info("Initial phase succeeded, so no follow-up phase is required.")
+        else:
+            logger.info("No follow-up phase is required after the initial phase.")
 
-            if booking_result:
-                if booking_result.outcome == "dry-run":
-                    logger.info("Success: would book %s", booking_result.slot.label)
-                elif booking_result.outcome == "confirmed":
-                    logger.info("Success: confirmed booking for %s", booking_result.slot.label)
-                elif booking_result.outcome == "unconfirmed":
-                    logger.warning(
-                        "Tried all preferred slots in order, but none reached the booking confirmation page. Last unconfirmed attempt: %s",
-                        booking_result.slot.label,
-                    )
-                else:
-                    logger.warning(
-                        "Booking was submitted for %s, but no explicit confirmation signal was detected. Verify it in the site.",
-                        booking_result.slot.label,
-                    )
-                if config.debug_pause_seconds > 0:
-                    logger.info(
-                        "DEBUG_PAUSE_SECONDS=%s so pausing on the available spaces page.",
-                        config.debug_pause_seconds,
-                    )
-                    await page.wait_for_timeout(config.debug_pause_seconds * 1000)
-                return 0
-
-            logger.info("No preferred slots were available to book.")
+        if booking_result:
+            if booking_result.outcome == "dry-run":
+                logger.info("Success: would book %s", booking_result.slot.label)
+            elif booking_result.outcome == "confirmed":
+                logger.info("Success: confirmed booking for %s", booking_result.slot.label)
+            elif booking_result.outcome == "unconfirmed":
+                logger.warning(
+                    "Tried all preferred slots in order, but none reached the booking confirmation page. Last unconfirmed attempt: %s",
+                    booking_result.slot.label,
+                )
+            else:
+                logger.warning(
+                    "Booking was submitted for %s, but no explicit confirmation signal was detected. Verify it in the site.",
+                    booking_result.slot.label,
+                )
             if config.debug_pause_seconds > 0:
                 logger.info(
                     "DEBUG_PAUSE_SECONDS=%s so pausing on the available spaces page.",
@@ -1428,29 +1652,66 @@ async def run_booking() -> int:
                 )
                 await page.wait_for_timeout(config.debug_pause_seconds * 1000)
             return 0
-        except (PlaywrightError, PlaywrightTimeoutError, RuntimeError, ValueError) as exc:
-            logger.exception("Booking run failed: %s", exc)
-            if page is not None:
-                await save_failure_screenshot(
-                    page,
-                    "booking-failure",
-                    config.timezone_name,
-                    logger,
-                )
-            return 1
+
+        logger.info("No preferred slots were available to book.")
+        if config.debug_pause_seconds > 0:
+            logger.info(
+                "DEBUG_PAUSE_SECONDS=%s so pausing on the available spaces page.",
+                config.debug_pause_seconds,
+            )
+            await page.wait_for_timeout(config.debug_pause_seconds * 1000)
+        return 0
+    except (PlaywrightError, PlaywrightTimeoutError, RuntimeError, ValueError) as exc:
+        if not initial_phase_recorded:
+            await record_initial_phase_result(coordinator, account.key, None)
+        logger.exception("Booking run failed: %s", exc)
+        if page is not None:
+            await save_failure_screenshot(
+                page,
+                f"{account.label}-booking-failure",
+                config.timezone_name,
+                logger,
+            )
+        return 1
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+                logger.info("Page closed.")
+            except PlaywrightError as exc:
+                logger.warning("Failed to close page cleanly: %s", exc)
+        if context is not None:
+            try:
+                await context.close()
+                logger.info("Browser context closed.")
+            except PlaywrightError as exc:
+                logger.warning("Failed to close browser context cleanly: %s", exc)
+
+
+async def run_booking() -> int:
+    config = load_config()
+    logger, log_path = setup_logging(config.timezone_name)
+    logger.info("Log file: %s", log_path)
+    logger.info(
+        "Configured booking accounts: %s",
+        ", ".join(account.label for account in config.accounts),
+    )
+
+    browser = None
+    coordinator = BookingCoordinator(expected_accounts=len(config.accounts))
+    async with async_playwright() as playwright:
+        try:
+            browser = await playwright.chromium.launch(headless=config.headless)
+            results = await asyncio.gather(
+                *[
+                    run_account_booking(browser, config, account, logger, coordinator)
+                    for account in config.accounts
+                ]
+            )
+            if any(result != 0 for result in results):
+                return 1
+            return 0
         finally:
-            if page is not None:
-                try:
-                    await page.close()
-                    logger.info("Page closed.")
-                except PlaywrightError as exc:
-                    logger.warning("Failed to close page cleanly: %s", exc)
-            if context is not None:
-                try:
-                    await context.close()
-                    logger.info("Browser context closed.")
-                except PlaywrightError as exc:
-                    logger.warning("Failed to close browser context cleanly: %s", exc)
             if browser is not None:
                 try:
                     await browser.close()

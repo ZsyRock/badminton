@@ -17,6 +17,7 @@ Python Playwright automation for booking badminton courts on Southampton Sport G
 - Stop after the first slot that reaches `Booking Confirmed!`
 - If a slot does not confirm, continue to the next preferred slot
 - `DRY_RUN=true` never clicks the final confirmation button
+- Optional `账号A` / `账号B` parallel booking support is available with coordinated fallback logic
 
 The script does not bypass CAPTCHA, MFA, verification pages, forbidden pages, or rate limits.
 
@@ -79,8 +80,13 @@ HEADLESS=true
 DRY_RUN=false
 TARGET_DATE_OVERRIDE=
 DEBUG_PAUSE_SECONDS=
-PREFERRED_TIMES=19:00,18:00
-PREFERRED_COURTS=1,2,3,4
+PREFERRED_TIMES=18:00,19:00,21:00
+PREFERRED_COURTS=4,3,2,1
+SECONDARY_BOOKING_ENABLED=false
+SECONDARY_GYM_USERNAME=
+SECONDARY_GYM_PASSWORD=
+SECONDARY_PREFERRED_TIMES=18:00,20:00,21:00
+SECONDARY_PREFERRED_COURTS=4,3,2,1
 ```
 
 Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_SECONDS` empty in production.
@@ -90,26 +96,23 @@ Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_S
 - `TIMEZONE`: keep `Europe/London` in production
 - `HEADLESS=true`: run without a visible browser
 - `DRY_RUN=true`: safe test mode, never confirms a booking
-- `PREFERRED_TIMES`: comma-separated times, e.g. `19:00,18:00`
-- `PREFERRED_COURTS`: comma-separated court numbers, e.g. `1,2,3,4`
+- `PREFERRED_TIMES`: comma-separated search window times for `账号A`
+- `PREFERRED_COURTS`: comma-separated court priority for `账号A`
+- `SECONDARY_BOOKING_ENABLED=true`: enable an optional second booking account in parallel
+- `SECONDARY_GYM_USERNAME` / `SECONDARY_GYM_PASSWORD`: credentials for the optional second account
+- `SECONDARY_PREFERRED_TIMES`: comma-separated search window times for `账号B`
+- `SECONDARY_PREFERRED_COURTS`: comma-separated court priority for `账号B`
 
-These two settings:
+The current coordinated booking logic is:
 
-```dotenv
-PREFERRED_TIMES=19:00,18:00
-PREFERRED_COURTS=1,2,3,4
-```
+1. `账号A` first tries `19:00 Jubilee Court 4, 3, 2, 1`
+2. `账号B` first tries `20:00 Jubilee Court 4, 3, 2, 1`
+3. If both succeed, the run ends
+4. If `账号A` fails and `账号B` succeeds, `账号A` then tries `21:00 Jubilee Court 4, 3, 2, 1`
+5. If `账号A` succeeds and `账号B` fails, `账号B` then tries `18:00 Jubilee Court 4, 3, 2, 1`
+6. If both fail, `账号A` then tries `18:00 Jubilee Court 4, 3, 2, 1` and `账号B` then tries `21:00 Jubilee Court 4, 3, 2, 1`
 
-produce this order:
-
-1. `19:00 Jubilee Court 1`
-2. `19:00 Jubilee Court 2`
-3. `19:00 Jubilee Court 3`
-4. `19:00 Jubilee Court 4`
-5. `18:00 Jubilee Court 1`
-6. `18:00 Jubilee Court 2`
-7. `18:00 Jubilee Court 3`
-8. `18:00 Jubilee Court 4`
+The `PREFERRED_TIMES` and `SECONDARY_PREFERRED_TIMES` settings control the search window used before opening available spaces. The code automatically adds any fallback times required by the coordinated A/B logic.
 
 ## Manual Runs
 

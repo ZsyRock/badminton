@@ -1,7 +1,12 @@
+import book_badminton
 from datetime import date, datetime
 
 from book_badminton import (
+    ACCOUNT_A_KEY,
+    ACCOUNT_B_KEY,
     booking_confirmation_detected,
+    build_search_window_times,
+    load_config,
     SlotPreference,
     build_preferred_starting_from_display_label,
     build_slot_priority,
@@ -19,10 +24,32 @@ from book_badminton import (
     post_login_success_detected,
     pick_best_available_slot,
     resolve_target_date,
+    resolve_follow_up_times_by_account,
     seconds_until_next_local_midnight,
     slot_card_text_matches,
     should_use_midnight_prewarm,
 )
+
+
+def clear_booking_env(monkeypatch):
+    for key in (
+        "BOOKING_URL",
+        "GYM_USERNAME",
+        "GYM_PASSWORD",
+        "TIMEZONE",
+        "HEADLESS",
+        "DRY_RUN",
+        "TARGET_DATE_OVERRIDE",
+        "DEBUG_PAUSE_SECONDS",
+        "PREFERRED_TIMES",
+        "PREFERRED_COURTS",
+        "SECONDARY_BOOKING_ENABLED",
+        "SECONDARY_GYM_USERNAME",
+        "SECONDARY_GYM_PASSWORD",
+        "SECONDARY_PREFERRED_TIMES",
+        "SECONDARY_PREFERRED_COURTS",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_compute_target_date_uses_europe_london_day_boundary():
@@ -51,6 +78,92 @@ def test_parse_target_date_override_rejects_other_formats():
         assert "TARGET_DATE_OVERRIDE" in str(exc)
     else:
         raise AssertionError("Expected ValueError for unsupported date override format")
+
+
+def test_load_config_adds_secondary_account_when_enabled(monkeypatch):
+    monkeypatch.setattr(book_badminton, "load_dotenv", lambda dotenv_path: None)
+    clear_booking_env(monkeypatch)
+    monkeypatch.setenv("GYM_USERNAME", "primary@example.com")
+    monkeypatch.setenv("GYM_PASSWORD", "primary-password")
+    monkeypatch.setenv("SECONDARY_BOOKING_ENABLED", "true")
+    monkeypatch.setenv("SECONDARY_GYM_USERNAME", "secondary@example.com")
+    monkeypatch.setenv("SECONDARY_GYM_PASSWORD", "secondary-password")
+    monkeypatch.setenv("SECONDARY_PREFERRED_TIMES", "20:00")
+    monkeypatch.setenv("SECONDARY_PREFERRED_COURTS", "1,2,3,4")
+
+    config = load_config()
+
+    assert [account.label for account in config.accounts] == ["账号A", "账号B"]
+    assert config.accounts[0].key == ACCOUNT_A_KEY
+    assert config.accounts[1].key == ACCOUNT_B_KEY
+    assert config.accounts[1].search_window_times == ("18:00", "20:00", "21:00")
+    assert config.accounts[1].court_priority == (1, 2, 3, 4)
+
+
+def test_load_config_disables_secondary_account_when_flag_is_false(monkeypatch):
+    monkeypatch.setattr(book_badminton, "load_dotenv", lambda dotenv_path: None)
+    clear_booking_env(monkeypatch)
+    monkeypatch.setenv("GYM_USERNAME", "primary@example.com")
+    monkeypatch.setenv("GYM_PASSWORD", "primary-password")
+    monkeypatch.setenv("SECONDARY_BOOKING_ENABLED", "false")
+    monkeypatch.setenv("SECONDARY_GYM_USERNAME", "secondary@example.com")
+    monkeypatch.setenv("SECONDARY_GYM_PASSWORD", "secondary-password")
+
+    config = load_config()
+
+    assert [account.label for account in config.accounts] == ["账号A"]
+
+
+def test_resolve_follow_up_times_handles_all_four_requested_scenarios():
+    assert resolve_follow_up_times_by_account(
+        {
+            ACCOUNT_A_KEY: True,
+            ACCOUNT_B_KEY: True,
+        }
+    ) == {
+        ACCOUNT_A_KEY: (),
+        ACCOUNT_B_KEY: (),
+    }
+    assert resolve_follow_up_times_by_account(
+        {
+            ACCOUNT_A_KEY: False,
+            ACCOUNT_B_KEY: True,
+        }
+    ) == {
+        ACCOUNT_A_KEY: ("21:00",),
+        ACCOUNT_B_KEY: (),
+    }
+    assert resolve_follow_up_times_by_account(
+        {
+            ACCOUNT_A_KEY: True,
+            ACCOUNT_B_KEY: False,
+        }
+    ) == {
+        ACCOUNT_A_KEY: (),
+        ACCOUNT_B_KEY: ("18:00",),
+    }
+    assert resolve_follow_up_times_by_account(
+        {
+            ACCOUNT_A_KEY: False,
+            ACCOUNT_B_KEY: False,
+        }
+    ) == {
+        ACCOUNT_A_KEY: ("18:00",),
+        ACCOUNT_B_KEY: ("21:00",),
+    }
+
+
+def test_build_search_window_times_always_includes_required_fallback_hours():
+    assert build_search_window_times(ACCOUNT_A_KEY, ("19:00",)) == (
+        "18:00",
+        "19:00",
+        "21:00",
+    )
+    assert build_search_window_times(ACCOUNT_B_KEY, ("20:00",)) == (
+        "18:00",
+        "20:00",
+        "21:00",
+    )
 
 
 def test_resolve_target_date_prefers_override_when_present():
