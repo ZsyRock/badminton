@@ -5,19 +5,18 @@ Python Playwright automation for booking badminton courts on Southampton Sport G
 ## Production Rules
 
 - Target date = current `Europe/London` date + 8 days
-- Preferred order:
-  1. `19:00 Jubilee Court 1`
-  2. `19:00 Jubilee Court 2`
-  3. `19:00 Jubilee Court 3`
-  4. `19:00 Jubilee Court 4`
-  5. `18:00 Jubilee Court 1`
-  6. `18:00 Jubilee Court 2`
-  7. `18:00 Jubilee Court 3`
-  8. `18:00 Jubilee Court 4`
+- `账号A`: `18:00 → 16:00 → 20:00`, Court `1 → 2 → 3 → 4`
+- `账号B`: `18:00 → 16:00 → 20:00`, Court `2 → 1 → 3 → 4`
+- `账号C`: `17:00 → 19:00 → 20:00`, Court `1 → 2 → 3 → 4`
+- For each shared A/B time, B waits only until A selects and claims a Court,
+  then immediately proceeds while skipping that exact slot
+- All three accounts use a shared exact-slot claim registry, including the
+  common `20:00` fallback, so they do not race one another for the same Court
 - Stop after the first slot that reaches `Booking Confirmed!`
 - If a slot does not confirm, continue to the next preferred slot
 - `DRY_RUN=true` never clicks the final confirmation button
-- Optional `账号A` / `账号B` parallel booking support is available with coordinated fallback logic
+- A transient stuck session is closed and re-created with a fresh login, with no
+  more than three total session attempts per account
 
 The script does not bypass CAPTCHA, MFA, verification pages, forbidden pages, or rate limits.
 
@@ -80,13 +79,20 @@ HEADLESS=true
 DRY_RUN=false
 TARGET_DATE_OVERRIDE=
 DEBUG_PAUSE_SECONDS=
-PREFERRED_TIMES=18:00,19:00,21:00
-PREFERRED_COURTS=4,3,2,1
+PREFERRED_TIMES=18:00,16:00,20:00
+PREFERRED_COURTS=1,2,3,4
 SECONDARY_BOOKING_ENABLED=false
 SECONDARY_GYM_USERNAME=
 SECONDARY_GYM_PASSWORD=
-SECONDARY_PREFERRED_TIMES=18:00,20:00,21:00
-SECONDARY_PREFERRED_COURTS=4,3,2,1
+SECONDARY_PREFERRED_TIMES=18:00,16:00,20:00
+SECONDARY_PREFERRED_COURTS=2,1,3,4
+TERTIARY_BOOKING_ENABLED=false
+TERTIARY_GYM_USERNAME=
+TERTIARY_GYM_PASSWORD=
+TERTIARY_PREFERRED_TIMES=17:00,19:00,20:00
+TERTIARY_PREFERRED_COURTS=1,2,3,4
+BOOKING_EMAIL_ENABLED=false
+BOOKING_EMAIL_REFERENCE_SCRIPT=/home/<YOUR_USERNAME>/send_ip_email.py
 ```
 
 Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_SECONDS` empty in production.
@@ -102,17 +108,56 @@ Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_S
 - `SECONDARY_GYM_USERNAME` / `SECONDARY_GYM_PASSWORD`: credentials for the optional second account
 - `SECONDARY_PREFERRED_TIMES`: comma-separated search window times for `账号B`
 - `SECONDARY_PREFERRED_COURTS`: comma-separated court priority for `账号B`
+- `TERTIARY_BOOKING_ENABLED=true`: enable `账号C` in parallel
+- `TERTIARY_GYM_USERNAME` / `TERTIARY_GYM_PASSWORD`: credentials for `账号C`
+- `TERTIARY_PREFERRED_TIMES`: comma-separated search window times for `账号C`
+- `TERTIARY_PREFERRED_COURTS`: comma-separated court priority for `账号C`
+- `BOOKING_EMAIL_ENABLED=true`: send an HTML report after a real (non-dry-run) booking run
+- `BOOKING_EMAIL_REFERENCE_SCRIPT`: optional path to the existing IP email script; its sender, Gmail app password, and recipient are read without executing the script
+- `BOOKING_EMAIL_FROM`, `BOOKING_EMAIL_APP_PASSWORD`, `BOOKING_EMAIL_APP_PASSWORD_FILE`, `BOOKING_EMAIL_TO`: optional explicit SMTP settings that take precedence over the reference script; the password-file option keeps the secret outside `.env`, and multiple recipients are comma-separated
 
-The current coordinated booking logic is:
+The daily email contains a one-sentence English summary of the current run and a
+schedule from the current date through the latest confirmed booking date reconstructed
+from `logs/`. Its table covers 16:00 through 20:00; consecutive booked cells are
+light green and isolated booked cells are light yellow. Keep booking logs if you want
+historical bookings to remain in the table.
 
-1. `账号A` first tries `19:00 Jubilee Court 4, 3, 2, 1`
-2. `账号B` first tries `20:00 Jubilee Court 4, 3, 2, 1`
-3. If both succeed, the run ends
-4. If `账号A` fails and `账号B` succeeds, `账号A` then tries `21:00 Jubilee Court 4, 3, 2, 1`
-5. If `账号A` succeeds and `账号B` fails, `账号B` then tries `18:00 Jubilee Court 4, 3, 2, 1`
-6. If both fail, `账号A` then tries `18:00 Jubilee Court 4, 3, 2, 1` and `账号B` then tries `21:00 Jubilee Court 4, 3, 2, 1`
+Optional local corrections can be stored in `manual_bookings.json`. This runtime
+data file is intentionally excluded from Git so personal booking history is not
+published with the source code.
 
-The `PREFERRED_TIMES` and `SECONDARY_PREFERRED_TIMES` settings control the search window used before opening available spaces. The code automatically adds any fallback times required by the coordinated A/B logic.
+Each booked slot is displayed as plain `Court N` text. The report does not add a
+calendar link, hidden event metadata, or calendar attachment to booked cells.
+
+The same rules apply to every target weekday. Each account moves to its next time
+only if it has not secured a booking. A and C use Court order `1, 2, 3, 4`; B uses
+`2, 1, 3, 4`. B waits for A's Court selection at each shared time (`18:00`,
+`16:00`, `20:00`) but no longer waits for the full confirmation page. Exact-slot
+claims are shared by A, B, and C, so the common `20:00` fallback also avoids
+same-Court races.
+
+The available-spaces result must match the requested date twice: the script only
+clicks the exact dated result and then verifies the calendar URL's `activityDate`
+in `Europe/London` before inspecting or clicking any slot. Logs include
+millisecond timestamps. Full-page button/text diagnostics run after all preferred
+times are exhausted (or during `DRY_RUN`), not before a successful production
+booking attempt.
+
+The preferred-time settings control the search window used before opening available
+spaces. The code automatically adds every time required by the fixed account plan.
+
+If the site adds a selected slot to the basket but does not reach the normal success
+page, the script preserves the original Court choice and completes the site's
+zero-price Basket → Checkout → Confirm flow. It verifies that the basket contains
+exactly one item matching the attempted Court and time before confirming. If the
+basket state is ambiguous, that account stops safely instead of risking a duplicate
+booking or blindly moving to another Court.
+
+For page timeouts or other transient browser failures before an ambiguous final
+submission, the failed page and browser context are closed and the account logs in
+again. Each account gets at most three total sessions. CAPTCHA, rate limiting,
+explicit login rejection, and uncertain post-submit states stop immediately rather
+than creating repeated login or duplicate-booking risk.
 
 ## Manual Runs
 
@@ -150,10 +195,11 @@ Add:
 
 ```cron
 CRON_TZ=Europe/London
-0 0 * * * cd /home/<YOUR_USERNAME>/badminton && /usr/bin/flock -n /tmp/badminton-booking.lock /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/book_badminton.py >> /home/<YOUR_USERNAME>/badminton/logs/cron-run.log 2>&1
+59 23 * * * /usr/bin/flock -n /tmp/badminton-booking.lock /bin/bash -lc 'sleep 30; cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/book_badminton.py >> /home/<YOUR_USERNAME>/badminton/logs/cron-run.log 2>&1'
 ```
 
-This runs every day at `00:00` London time and prevents overlapping runs.
+This starts every day at `23:59:30` London time, prewarms the three account sessions,
+submits the searches at midnight, and prevents overlapping runs.
 
 Check it:
 

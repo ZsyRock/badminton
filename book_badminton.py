@@ -9,13 +9,16 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
+
+from booking_email import email_notifications_enabled, send_booking_report
 
 
 DEFAULT_BOOKING_URL = "https://soton.gladstonego.cloud/account"
@@ -35,12 +38,31 @@ BLOCKER_PATTERNS = (
     "too many requests",
     "verify you are human",
 )
+AUTHENTICATION_FAILURE_PATTERNS = (
+    "invalid email or password",
+    "incorrect email or password",
+    "invalid username or password",
+    "login failed",
+    "credentials are incorrect",
+    "account is locked",
+)
 MIDNIGHT_PREWARM_WINDOW_SECONDS = 120
+MAX_ACCOUNT_SESSION_ATTEMPTS = 3
+ACCOUNT_RETRY_DELAY_SECONDS = 2
 ACCOUNT_A_KEY = "account_a"
 ACCOUNT_B_KEY = "account_b"
+ACCOUNT_C_KEY = "account_c"
 ACCOUNT_A_LABEL = "账号A"
 ACCOUNT_B_LABEL = "账号B"
+ACCOUNT_C_LABEL = "账号C"
+ACCOUNT_ATTEMPT_TIMES = {
+    ACCOUNT_A_KEY: ("18:00", "16:00", "20:00"),
+    ACCOUNT_B_KEY: ("18:00", "16:00", "20:00"),
+    ACCOUNT_C_KEY: ("17:00", "19:00", "20:00"),
+}
 SUCCESSFUL_BOOKING_OUTCOMES = {"confirmed", "dry-run"}
+BASKET_ITEM_ADDED_TEXT = "added to basket"
+BASKET_SLOT_CONFLICT_TEXT = "you already have a booking for this slot in your basket"
 
 
 @dataclass(frozen=True)
@@ -82,16 +104,41 @@ class BookingAttemptResult:
 
 @dataclass
 class BookingCoordinator:
-    expected_accounts: int
-    initial_phase_results: dict[str, BookingAttemptResult | None] = field(default_factory=dict)
-    follow_up_times_by_account: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    follow_up_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    target_date: date
+    release_at: datetime | None = None
+    phase_selections: dict[tuple[str, str], SlotPreference | None] = field(
+        default_factory=dict
+    )
+    phase_selection_ready: dict[tuple[str, str], asyncio.Event] = field(
+        default_factory=dict
+    )
+    slot_claim_owners: dict[SlotPreference, str] = field(default_factory=dict)
+
+
+@dataclass
+class AccountRunProgress:
+    completed_times: set[str] = field(default_factory=set)
 
 
 class AccountLoggerAdapter(logging.LoggerAdapter):
     def process(self, msg: str, kwargs: dict[str, object]) -> tuple[str, dict[str, object]]:
         return f"[{self.extra['account_label']}] {msg}", kwargs
+
+
+class BasketRecoveryError(RuntimeError):
+    """Raised when a submitted slot is in the basket but cannot be safely confirmed."""
+
+
+class AccessBlockerError(RuntimeError):
+    """Raised for anti-automation or account-protection pages that must not be retried."""
+
+
+class AuthenticationError(RuntimeError):
+    """Raised when the site explicitly rejects an account login."""
+
+
+class TargetDateValidationError(RuntimeError):
+    """Raised when the calendar page cannot be tied to the requested date."""
 
 
 def parse_bool(value: str | None, default: bool) -> bool:
@@ -299,6 +346,45 @@ def build_available_spaces_button_pattern(target_date: date) -> re.Pattern[str]:
     )
 
 
+def calendar_activity_date_from_url(
+    calendar_url: str,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> date:
+    activity_dates = parse_qs(urlsplit(calendar_url).query).get("activityDate", [])
+    if len(activity_dates) != 1 or not activity_dates[0].strip():
+        raise TargetDateValidationError(
+            "The available-spaces URL did not contain exactly one activityDate."
+        )
+
+    raw_value = activity_dates[0].strip()
+    if raw_value.endswith(("Z", "z")):
+        raw_value = f"{raw_value[:-1]}+00:00"
+    try:
+        activity_datetime = datetime.fromisoformat(raw_value)
+    except ValueError as exc:
+        raise TargetDateValidationError(
+            f"The calendar activityDate was not a valid ISO timestamp: {activity_dates[0]!r}."
+        ) from exc
+    if activity_datetime.tzinfo is None:
+        raise TargetDateValidationError(
+            "The calendar activityDate did not include a timezone offset."
+        )
+    return activity_datetime.astimezone(ZoneInfo(timezone_name)).date()
+
+
+def validate_calendar_target_date(
+    calendar_url: str,
+    target_date: date,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> None:
+    actual_date = calendar_activity_date_from_url(calendar_url, timezone_name)
+    if actual_date != target_date:
+        raise TargetDateValidationError(
+            "The available-spaces calendar date did not match the requested date: "
+            f"expected {target_date.isoformat()}, found {actual_date.isoformat()}."
+        )
+
+
 def build_slot_button_pattern(slot: SlotPreference) -> re.Pattern[str]:
     button_time = format_time_for_button_label(slot.start_time)
     return re.compile(
@@ -395,47 +481,15 @@ def booking_attempt_succeeded(result: BookingAttemptResult | None) -> bool:
     return result is not None and result.outcome in SUCCESSFUL_BOOKING_OUTCOMES
 
 
-def get_initial_attempt_times(account_key: str) -> tuple[str, ...]:
-    if account_key == ACCOUNT_A_KEY:
-        return ("19:00",)
-    if account_key == ACCOUNT_B_KEY:
-        return ("20:00",)
-    raise ValueError(f"Unsupported account key: {account_key}")
-
-
-def resolve_follow_up_times_by_account(
-    initial_success_by_account: dict[str, bool],
-) -> dict[str, tuple[str, ...]]:
-    account_a_success = initial_success_by_account.get(ACCOUNT_A_KEY, False)
-    account_b_success = initial_success_by_account.get(ACCOUNT_B_KEY, False)
-
-    if account_a_success and account_b_success:
-        return {
-            ACCOUNT_A_KEY: (),
-            ACCOUNT_B_KEY: (),
-        }
-    if not account_a_success and account_b_success:
-        return {
-            ACCOUNT_A_KEY: ("21:00",),
-            ACCOUNT_B_KEY: (),
-        }
-    if account_a_success and not account_b_success:
-        return {
-            ACCOUNT_A_KEY: (),
-            ACCOUNT_B_KEY: ("18:00",),
-        }
-    return {
-        ACCOUNT_A_KEY: ("18:00",),
-        ACCOUNT_B_KEY: ("21:00",),
-    }
+def get_account_attempt_times(account_key: str) -> tuple[str, ...]:
+    try:
+        return ACCOUNT_ATTEMPT_TIMES[account_key]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported account key: {account_key}") from exc
 
 
 def get_required_search_window_times(account_key: str) -> tuple[str, ...]:
-    if account_key == ACCOUNT_A_KEY:
-        return ("18:00", "19:00", "21:00")
-    if account_key == ACCOUNT_B_KEY:
-        return ("18:00", "20:00", "21:00")
-    raise ValueError(f"Unsupported account key: {account_key}")
+    return get_account_attempt_times(account_key)
 
 
 def build_search_window_times(
@@ -466,6 +520,39 @@ def booking_confirmation_detected(current_url: str, body_text: str) -> bool:
         return True
 
     return False
+
+
+def basket_item_added_detected(body_text: str) -> bool:
+    return BASKET_ITEM_ADDED_TEXT in " ".join(body_text.split()).lower()
+
+
+def basket_slot_conflict_detected(body_text: str) -> bool:
+    return BASKET_SLOT_CONFLICT_TEXT in " ".join(body_text.split()).lower()
+
+
+def basket_contains_expected_slot(
+    basket_item_text: str,
+    slot: SlotPreference,
+    target_date: date,
+) -> bool:
+    normalized_text = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        normalize_visible_text(basket_item_text).lower(),
+    ).strip()
+    court_label = f"jubilee court {slot.court_number}"
+    time_range = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        format_slot_time_range(slot.start_time).lower(),
+    ).strip()
+    date_label = (
+        f"{target_date:%a} {target_date.day} {target_date:%B} {target_date.year}"
+    ).lower()
+    return all(
+        expected in normalized_text
+        for expected in ("badminton", court_label, time_range, date_label)
+    )
 
 
 def build_account_config(
@@ -504,11 +591,11 @@ def load_config() -> AppConfig:
     target_date_override = os.getenv("TARGET_DATE_OVERRIDE", "").strip() or None
     primary_search_window_times = parse_csv_strings(
         os.getenv("PREFERRED_TIMES"),
-        default=("18:00", "19:00", "21:00"),
+        default=ACCOUNT_ATTEMPT_TIMES[ACCOUNT_A_KEY],
     )
     primary_court_priority = parse_csv_ints(
         os.getenv("PREFERRED_COURTS"),
-        default=(4, 3, 2, 1),
+        default=(1, 2, 3, 4),
     )
     accounts = [
         build_account_config(
@@ -533,11 +620,11 @@ def load_config() -> AppConfig:
     if secondary_enabled:
         secondary_search_window_times = parse_csv_strings(
             os.getenv("SECONDARY_PREFERRED_TIMES"),
-            default=("18:00", "20:00", "21:00"),
+            default=ACCOUNT_ATTEMPT_TIMES[ACCOUNT_B_KEY],
         )
         secondary_court_priority = parse_csv_ints(
             os.getenv("SECONDARY_PREFERRED_COURTS"),
-            default=(4, 3, 2, 1),
+            default=(2, 1, 3, 4),
         )
         accounts.append(
             build_account_config(
@@ -547,6 +634,35 @@ def load_config() -> AppConfig:
                 password=secondary_password,
                 search_window_times=secondary_search_window_times,
                 court_priority=secondary_court_priority,
+            )
+        )
+
+    tertiary_username = os.getenv("TERTIARY_GYM_USERNAME", "")
+    tertiary_password = os.getenv("TERTIARY_GYM_PASSWORD", "")
+    tertiary_enabled_default = bool(
+        tertiary_username.strip() or tertiary_password.strip()
+    )
+    tertiary_enabled = parse_bool(
+        os.getenv("TERTIARY_BOOKING_ENABLED"),
+        default=tertiary_enabled_default,
+    )
+    if tertiary_enabled:
+        tertiary_search_window_times = parse_csv_strings(
+            os.getenv("TERTIARY_PREFERRED_TIMES"),
+            default=ACCOUNT_ATTEMPT_TIMES[ACCOUNT_C_KEY],
+        )
+        tertiary_court_priority = parse_csv_ints(
+            os.getenv("TERTIARY_PREFERRED_COURTS"),
+            default=(1, 2, 3, 4),
+        )
+        accounts.append(
+            build_account_config(
+                key=ACCOUNT_C_KEY,
+                label=ACCOUNT_C_LABEL,
+                username=tertiary_username,
+                password=tertiary_password,
+                search_window_times=tertiary_search_window_times,
+                court_priority=tertiary_court_priority,
             )
         )
 
@@ -574,7 +690,7 @@ def setup_logging(timezone_name: str) -> tuple[logging.Logger, Path]:
     logger.propagate = False
 
     formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s",
+        "%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -648,8 +764,24 @@ async def check_for_access_blockers(
                 config.timezone_name,
                 logger,
             )
-            raise RuntimeError(
+            raise AccessBlockerError(
                 f"Encountered blocker '{pattern}'. Stopping without attempting to bypass site protections."
+            )
+
+
+async def check_for_authentication_failure(page: Page) -> None:
+    try:
+        content = normalize_visible_text(
+            await page.locator("body").inner_text(timeout=2_000)
+        )
+    except PlaywrightError:
+        return
+
+    for pattern in AUTHENTICATION_FAILURE_PATTERNS:
+        if pattern in content:
+            raise AuthenticationError(
+                "The site explicitly rejected the login. Stopping without repeated "
+                "password attempts."
             )
 
 
@@ -703,6 +835,7 @@ async def wait_for_booking_entrypoint(
 
     while asyncio.get_running_loop().time() < deadline:
         await check_for_access_blockers(page, config, logger)
+        await check_for_authentication_failure(page)
         activity_form_visible = await is_visible(get_activity_textbox(page))
         make_booking_visible = await is_visible(get_make_booking_button(page))
         book_nav_visible = await is_visible(get_book_nav_locator(page))
@@ -1039,6 +1172,18 @@ async def log_available_spaces_diagnostics(
         )
 
 
+async def log_available_spaces_diagnostics_best_effort(
+    page: Page,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+) -> None:
+    try:
+        await log_available_spaces_diagnostics(page, config, account, logger)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never disrupt booking
+        logger.warning("Could not collect available-spaces diagnostics: %s", exc)
+
+
 async def wait_for_available_spaces_content(
     page: Page,
     config: AppConfig,
@@ -1167,6 +1312,7 @@ async def submit_badminton_search(
     logger: logging.Logger,
 ) -> None:
     search_button = page.get_by_role("button", name="Search for activities")
+    logger.info("Timing milestone | dispatching booking search click.")
     await search_button.click()
     await page.wait_for_load_state("networkidle")
     await check_for_access_blockers(page, config, logger)
@@ -1186,19 +1332,32 @@ async def open_available_spaces(
         "button",
         name=build_available_spaces_button_pattern(target_date),
     ).first
-    if not await see_spaces.count():
-        see_spaces = page.get_by_role(
-            "button",
-            name=re.compile(r"Badminton starts on.*See available spaces", re.IGNORECASE),
-        ).first
-
     await see_spaces.wait_for(state="visible", timeout=20_000)
+    logger.info(
+        "Timing milestone | dispatching exact-date available-spaces click for %s.",
+        format_date_for_site(target_date),
+    )
     await see_spaces.click()
     await page.wait_for_load_state("networkidle")
     await check_for_access_blockers(page, config, logger)
     await wait_for_available_spaces_content(page, config, logger)
+    validate_calendar_target_date(
+        page.url,
+        target_date,
+        config.timezone_name,
+    )
+    logger.info(
+        "Verified available-spaces calendar date: %s",
+        format_date_for_site(target_date),
+    )
     logger.info("Available spaces page opened.")
-    await log_available_spaces_diagnostics(page, config, account, logger)
+    if config.dry_run:
+        await log_available_spaces_diagnostics_best_effort(
+            page,
+            config,
+            account,
+            logger,
+        )
 
 
 async def get_visible_slot_button(page: Page, slot: SlotPreference) -> Locator | None:
@@ -1261,6 +1420,7 @@ async def log_post_confirmation_state(
     )
     diagnostic_keywords = success_keywords + (
         "confirmed",
+        "basket",
         "unable",
         "unavailable",
         "error",
@@ -1328,6 +1488,255 @@ async def wait_for_booking_confirmation_page(
     return False
 
 
+async def read_page_body_text(page: Page, timeout_ms: int = 5_000) -> str:
+    try:
+        return await page.locator("body").inner_text(timeout=timeout_ms)
+    except PlaywrightError:
+        return ""
+
+
+async def wait_for_network_idle_best_effort(
+    page: Page,
+    logger: logging.Logger,
+    description: str,
+    timeout_ms: int = 5_000,
+) -> None:
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        logger.info(
+            "Network did not reach idle after %s; continuing with visible page-state checks.",
+            description,
+        )
+
+
+async def recover_pending_basket_booking(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+) -> bool:
+    """Complete the site's zero-price checkout for exactly one known basket item."""
+
+    logger.warning(
+        "%s was added to the basket without reaching confirmation; attempting the "
+        "site's zero-price basket checkout.",
+        slot.label,
+    )
+
+    try:
+        go_to_basket = page.locator("#go-to-basket-btn").first
+        await go_to_basket.wait_for(state="visible", timeout=5_000)
+        await go_to_basket.click()
+        await page.wait_for_url(
+            re.compile(r"/book/(?:basket|success)(?:[/?#]|$)", re.IGNORECASE),
+            timeout=10_000,
+        )
+        await wait_for_network_idle_best_effort(
+            page,
+            logger,
+            "opening the basket",
+        )
+        await check_for_access_blockers(page, config, logger)
+
+        arrival_body = await read_page_body_text(page)
+        if booking_confirmation_detected(page.url, arrival_body):
+            logger.info(
+                "Booking confirmation appeared while opening the basket for %s.",
+                slot.label,
+            )
+            return True
+
+        if "/book/basket" not in page.url.lower():
+            raise BasketRecoveryError(
+                f"The basket link for {slot.label} did not open the expected basket page."
+            )
+
+        basket_item = page.locator(".basket-item").first
+        await basket_item.wait_for(state="visible", timeout=10_000)
+        basket_item_count = await page.locator(".basket-item").count()
+        if basket_item_count != 1:
+            raise BasketRecoveryError(
+                f"Expected exactly one basket item for {slot.label}, but found "
+                f"{basket_item_count}. Stopping to avoid confirming an unrelated item."
+            )
+        basket_item_text = await basket_item.inner_text(timeout=5_000)
+        if not basket_contains_expected_slot(basket_item_text, slot, target_date):
+            raise BasketRecoveryError(
+                f"The basket item did not match {slot.label}. Stopping to avoid "
+                "confirming an unrelated item."
+            )
+        if "£0.00" not in basket_item_text:
+            raise BasketRecoveryError(
+                f"The basket for {slot.label} was not explicitly shown as £0.00. "
+                "Stopping instead of entering a paid checkout."
+            )
+
+        continue_to_payment = page.locator("#continue-to-payment-btn").first
+        await continue_to_payment.wait_for(state="visible", timeout=10_000)
+        await continue_to_payment.click(timeout=10_000)
+        await page.wait_for_url(
+            re.compile(r"/book/(?:checkout|success)(?:[/?#]|$)", re.IGNORECASE),
+            timeout=10_000,
+        )
+        logger.info("Opened zero-price checkout for %s from the basket.", slot.label)
+        await wait_for_network_idle_best_effort(
+            page,
+            logger,
+            "opening zero-price checkout",
+        )
+        await check_for_access_blockers(page, config, logger)
+
+        checkout_body = await read_page_body_text(page)
+        if booking_confirmation_detected(page.url, checkout_body):
+            logger.info(
+                "Booking confirmation appeared while opening checkout for %s.",
+                slot.label,
+            )
+            return True
+
+        if "/book/checkout" not in page.url.lower():
+            raise BasketRecoveryError(
+                f"The basket checkout for {slot.label} did not open the expected "
+                "checkout page."
+            )
+
+        submit_no_price = page.locator("#submit-no-price-btn").first
+        await submit_no_price.wait_for(state="visible", timeout=10_000)
+        await submit_no_price.click(timeout=10_000)
+        logger.info("Submitted zero-price basket confirmation for %s.", slot.label)
+        await wait_for_network_idle_best_effort(
+            page,
+            logger,
+            "submitting zero-price basket confirmation",
+        )
+    except BasketRecoveryError:
+        raise
+    except PlaywrightError as exc:
+        raise BasketRecoveryError(
+            f"Could not complete the basket recovery controls for {slot.label}: {exc}"
+        ) from exc
+
+    if await wait_for_booking_confirmation_page(
+        page,
+        slot,
+        config,
+        account,
+        logger,
+    ):
+        logger.info("Recovered and confirmed %s through the basket.", slot.label)
+        return True
+
+    raise BasketRecoveryError(
+        f"Basket checkout for {slot.label} was submitted, but no explicit booking "
+        "confirmation was detected. Stopping to avoid a duplicate booking."
+    )
+
+
+async def recover_basket_state_if_present(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+) -> str | None:
+    try:
+        body_text = await page.locator("body").inner_text(timeout=5_000)
+    except PlaywrightError as exc:
+        raise BasketRecoveryError(
+            f"Could not inspect the page after the unconfirmed attempt for "
+            f"{slot.label}. Stopping to avoid a duplicate booking."
+        ) from exc
+    if not body_text.strip():
+        raise BasketRecoveryError(
+            f"The page was blank after the unconfirmed attempt for {slot.label}. "
+            "Stopping to avoid a duplicate booking."
+        )
+
+    if booking_confirmation_detected(page.url, body_text):
+        logger.info(
+            "Recovered an explicit booking confirmation for %s while checking the "
+            "post-submit page state.",
+            slot.label,
+        )
+        return "confirmed"
+
+    if basket_item_added_detected(body_text):
+        recovered = await recover_pending_basket_booking(
+            page,
+            slot,
+            target_date,
+            config,
+            account,
+            logger,
+        )
+        return "confirmed" if recovered else None
+
+    if basket_slot_conflict_detected(body_text):
+        raise BasketRecoveryError(
+            f"The site reports that the {slot.start_time} slot is already in the "
+            "basket, but it was not added by this recoverable attempt. Stopping to "
+            "avoid confirming or creating a duplicate booking."
+        )
+
+    return None
+
+
+async def recover_or_stop_after_unknown_final_action(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+    cause: Exception,
+) -> str:
+    try:
+        recovered_outcome = await recover_basket_state_if_present(
+            page,
+            slot,
+            target_date,
+            config,
+            account,
+            logger,
+        )
+    except (AccessBlockerError, BasketRecoveryError):
+        raise
+    except Exception as recovery_exc:  # noqa: BLE001 - final-submit safety boundary
+        raise BasketRecoveryError(
+            f"The final booking action for {slot.label} ended in an unknown state, "
+            "and the page could not be inspected safely. Stopping to avoid a "
+            "duplicate booking."
+        ) from recovery_exc
+
+    if recovered_outcome is not None:
+        return recovered_outcome
+    raise BasketRecoveryError(
+        f"The final booking action for {slot.label} ended in an unknown state. "
+        "Stopping to avoid a duplicate booking."
+    ) from cause
+
+
+async def current_slot_is_unavailable(page: Page, slot: SlotPreference) -> bool:
+    card = await find_slot_card(page, slot)
+    if card is None:
+        return False
+    try:
+        card_text = " ".join((await card.inner_text()).split()).lower()
+    except PlaywrightError:
+        return False
+    return any(
+        message in card_text
+        for message in (
+            "this slot is unavailable",
+            "no additional spaces available",
+        )
+    )
+
+
 async def close_open_slot_panel(page: Page, slot: SlotPreference, logger: logging.Logger) -> None:
     close_patterns = (
         re.compile(r"cancel.*close activity slot form", re.IGNORECASE),
@@ -1354,9 +1763,11 @@ async def try_book_slot(
     page: Page,
     start_time: str,
     court_number: int,
+    target_date: date,
     config: AppConfig,
     account: BookingAccountConfig,
     logger: logging.Logger,
+    claim_slot: Callable[[SlotPreference], bool] | None = None,
 ) -> str | None:
     slot = SlotPreference(start_time=start_time, court_number=court_number)
     logger.info("Trying preferred slot: %s", slot.label)
@@ -1370,6 +1781,18 @@ async def try_book_slot(
         )
         return None
 
+    if claim_slot is not None:
+        if not claim_slot(slot):
+            logger.info(
+                "Skipping %s because another account already claimed that exact slot.",
+                slot.label,
+            )
+            return None
+        logger.info(
+            "Selected and claimed %s; coordinated accounts may now choose another court.",
+            slot.label,
+        )
+
     await initial_button.click()
     logger.info("Opened details panel for %s", slot.label)
     await check_for_access_blockers(page, config, logger)
@@ -1379,25 +1802,99 @@ async def try_book_slot(
         return "dry-run"
 
     final_button = await find_final_book_button(page)
-    await final_button.wait_for(state="visible", timeout=15_000)
-    await final_button.click()
+    try:
+        await final_button.wait_for(state="visible", timeout=15_000)
+    except PlaywrightTimeoutError:
+        recovered_outcome = await recover_basket_state_if_present(
+            page,
+            slot,
+            target_date,
+            config,
+            account,
+            logger,
+        )
+        if recovered_outcome is not None:
+            return recovered_outcome
+
+        if await current_slot_is_unavailable(page, slot):
+            logger.info(
+                "The final booking button disappeared because %s became unavailable; "
+                "continuing to the next preference.",
+                slot.label,
+            )
+            await close_open_slot_panel(page, slot, logger)
+            return "unconfirmed"
+        raise
+
+    try:
+        await final_button.click()
+    except Exception as exc:  # noqa: BLE001 - click may already have reached the site
+        return await recover_or_stop_after_unknown_final_action(
+            page,
+            slot,
+            target_date,
+            config,
+            account,
+            logger,
+            exc,
+        )
     logger.info("Clicked final Book Badminton confirmation for %s", slot.label)
     try:
-        await page.wait_for_load_state("networkidle", timeout=5_000)
-    except PlaywrightTimeoutError:
-        logger.info("Network did not reach idle promptly after confirming %s; continuing to wait for confirmation page.", slot.label)
-    confirmation_detected = await wait_for_booking_confirmation_page(
-        page,
-        slot,
-        config,
-        account,
-        logger,
-    )
-    if confirmation_detected:
-        return "confirmed"
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5_000)
+        except PlaywrightTimeoutError:
+            logger.info(
+                "Network did not reach idle promptly after confirming %s; "
+                "continuing to wait for confirmation page.",
+                slot.label,
+            )
+        confirmation_detected = await wait_for_booking_confirmation_page(
+            page,
+            slot,
+            config,
+            account,
+            logger,
+        )
+        if confirmation_detected:
+            return "confirmed"
 
-    await close_open_slot_panel(page, slot, logger)
-    return "unconfirmed"
+        recovered_outcome = await recover_basket_state_if_present(
+            page,
+            slot,
+            target_date,
+            config,
+            account,
+            logger,
+        )
+        if recovered_outcome is not None:
+            return recovered_outcome
+
+        if await current_slot_is_unavailable(page, slot):
+            logger.info(
+                "%s became unavailable without a confirmation or basket item; "
+                "continuing to the next preference.",
+                slot.label,
+            )
+            await close_open_slot_panel(page, slot, logger)
+            return "unconfirmed"
+
+        raise BasketRecoveryError(
+            f"The final booking action for {slot.label} produced neither a "
+            "confirmation nor a recoverable basket item. Stopping to avoid a "
+            "duplicate booking."
+        )
+    except (AccessBlockerError, BasketRecoveryError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - submission has already been sent
+        return await recover_or_stop_after_unknown_final_action(
+            page,
+            slot,
+            target_date,
+            config,
+            account,
+            logger,
+            exc,
+        )
 
 
 async def book_best_available_slot(
@@ -1405,9 +1902,11 @@ async def book_best_available_slot(
     config: AppConfig,
     account: BookingAccountConfig,
     logger: logging.Logger,
+    target_date: date,
     preferences: Sequence[SlotPreference],
     phase_name: str,
     booking_flow_started_at: float | None = None,
+    claim_slot: Callable[[SlotPreference], bool] | None = None,
 ) -> BookingAttemptResult | None:
     if not preferences:
         logger.info("No slot preferences were configured for the %s phase.", phase_name)
@@ -1417,7 +1916,7 @@ async def book_best_available_slot(
     visible_slots = await list_visible_bookable_slots(page, preferences)
     if booking_flow_started_at is not None:
         logger.info(
-            "Timing | login page open -> preferred slot availability resolved: %.2fs",
+            "Timing | login page open -> preferred slot availability resolved: %.3fs",
             perf_counter() - booking_flow_started_at,
         )
     if visible_slots:
@@ -1435,9 +1934,11 @@ async def book_best_available_slot(
             page,
             slot.start_time,
             slot.court_number,
+            target_date,
             config,
             account,
             logger,
+            claim_slot,
         )
         if outcome == "unconfirmed":
             last_unconfirmed_slot = slot
@@ -1460,26 +1961,278 @@ def get_account_logger(
     return AccountLoggerAdapter(base_logger, {"account_label": account.label})
 
 
-async def record_initial_phase_result(
+def _phase_selection_key(account_key: str, start_time: str) -> tuple[str, str]:
+    return account_key, start_time
+
+
+def get_phase_selection_event(
     coordinator: BookingCoordinator,
     account_key: str,
-    result: BookingAttemptResult | None,
-) -> None:
-    async with coordinator.lock:
-        if account_key not in coordinator.initial_phase_results:
-            coordinator.initial_phase_results[account_key] = result
+    start_time: str,
+) -> asyncio.Event:
+    key = _phase_selection_key(account_key, start_time)
+    return coordinator.phase_selection_ready.setdefault(key, asyncio.Event())
 
-        if (
-            len(coordinator.initial_phase_results) == coordinator.expected_accounts
-            and not coordinator.follow_up_ready.is_set()
-        ):
-            coordinator.follow_up_times_by_account = resolve_follow_up_times_by_account(
-                {
-                    key: booking_attempt_succeeded(value)
-                    for key, value in coordinator.initial_phase_results.items()
-                }
+
+def publish_phase_selection(
+    coordinator: BookingCoordinator,
+    account_key: str,
+    start_time: str,
+    selection: SlotPreference | None,
+) -> None:
+    key = _phase_selection_key(account_key, start_time)
+    ready_event = get_phase_selection_event(coordinator, account_key, start_time)
+
+    if ready_event.is_set():
+        return
+    coordinator.phase_selections[key] = selection
+    ready_event.set()
+
+
+def release_remaining_account_phases(
+    coordinator: BookingCoordinator,
+    account_key: str,
+) -> None:
+    for start_time in get_account_attempt_times(account_key):
+        publish_phase_selection(coordinator, account_key, start_time, None)
+
+
+async def wait_for_phase_selection(
+    coordinator: BookingCoordinator,
+    account_key: str,
+    start_time: str,
+    logger: logging.Logger,
+) -> SlotPreference | None:
+    ready_event = get_phase_selection_event(coordinator, account_key, start_time)
+
+    logger.info(
+        "Waiting for Account A to select a %s court before Account B starts the same time.",
+        start_time,
+    )
+    await ready_event.wait()
+    return coordinator.phase_selections.get(
+        _phase_selection_key(account_key, start_time)
+    )
+
+
+def claim_slot_for_account(
+    coordinator: BookingCoordinator,
+    account_key: str,
+    slot: SlotPreference,
+) -> bool:
+    owner = coordinator.slot_claim_owners.get(slot)
+    if owner is not None and owner != account_key:
+        return False
+    coordinator.slot_claim_owners.setdefault(slot, account_key)
+    publish_phase_selection(
+        coordinator,
+        account_key,
+        slot.start_time,
+        slot,
+    )
+    return True
+
+
+def _account_is_configured(config: AppConfig, account_key: str) -> bool:
+    return any(account.key == account_key for account in config.accounts)
+
+
+def build_phase_preferences(
+    account: BookingAccountConfig,
+    start_time: str,
+    coordinator: BookingCoordinator | None = None,
+) -> list[SlotPreference]:
+    preferences = build_account_slot_priority(account, (start_time,))
+    if coordinator is not None:
+        preferences = [
+            slot
+            for slot in preferences
+            if coordinator.slot_claim_owners.get(slot) in (None, account.key)
+        ]
+    return preferences
+
+
+async def run_account_booking_session(
+    browser,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+    coordinator: BookingCoordinator,
+    progress: AccountRunProgress,
+    attempt_number: int,
+) -> BookingAttemptResult | None:
+    context = None
+    page = None
+    target_date = coordinator.target_date
+    try:
+        context = await browser.new_context(
+            locale="en-GB",
+            timezone_id=config.timezone_name,
+        )
+        page = await context.new_page()
+        booking_flow_started_at = perf_counter()
+
+        await login(page, config, account, logger)
+        logger.info(
+            "Timing | session %s login page open -> login complete: %.3fs",
+            attempt_number,
+            perf_counter() - booking_flow_started_at,
+        )
+        await open_booking_search(page, config, logger)
+
+        local_now = get_local_now(config.timezone_name)
+        if coordinator.release_at is not None and local_now < coordinator.release_at:
+            logger.info(
+                "Prewarming the booking search form for %s before midnight.",
+                format_date_for_site(target_date),
             )
-            coordinator.follow_up_ready.set()
+            await prepare_badminton_search_form(
+                page,
+                target_date,
+                config,
+                account,
+                logger,
+            )
+            wait_seconds = max(
+                (coordinator.release_at - get_local_now(config.timezone_name)).total_seconds(),
+                0.0,
+            )
+            if wait_seconds > 0:
+                logger.info(
+                    "Midnight prewarm mode is waiting %.3fs before submitting the search.",
+                    wait_seconds,
+                )
+                await page.wait_for_timeout(int(wait_seconds * 1000))
+            await submit_badminton_search(page, config, logger)
+        else:
+            await search_badminton(page, target_date, config, account, logger)
+
+        logger.info(
+            "Timing | session %s login page open -> search submitted: %.3fs",
+            attempt_number,
+            perf_counter() - booking_flow_started_at,
+        )
+        await open_available_spaces(page, target_date, config, account, logger)
+        logger.info(
+            "Timing | session %s login page open -> available spaces page opened: %.3fs",
+            attempt_number,
+            perf_counter() - booking_flow_started_at,
+        )
+
+        last_result: BookingAttemptResult | None = None
+        for start_time in get_account_attempt_times(account.key):
+            if start_time in progress.completed_times:
+                logger.info(
+                    "Skipping already completed %s phase after session recovery.",
+                    start_time,
+                )
+                continue
+
+            if (
+                account.key == ACCOUNT_B_KEY
+                and _account_is_configured(config, ACCOUNT_A_KEY)
+            ):
+                account_a_selection = await wait_for_phase_selection(
+                    coordinator,
+                    ACCOUNT_A_KEY,
+                    start_time,
+                    logger,
+                )
+                if account_a_selection is not None:
+                    logger.info(
+                        "Account A selected %s, so Account B will skip that exact slot without waiting for confirmation.",
+                        account_a_selection.label,
+                    )
+
+            preferences = build_phase_preferences(
+                account,
+                start_time,
+                coordinator,
+            )
+
+            logger.info(
+                "%s booking phase targets: %s",
+                start_time,
+                ", ".join(slot.label for slot in preferences),
+            )
+            phase_result = await book_best_available_slot(
+                page,
+                config,
+                account,
+                logger,
+                target_date=target_date,
+                preferences=preferences,
+                phase_name=start_time,
+                booking_flow_started_at=(
+                    booking_flow_started_at
+                    if not progress.completed_times
+                    else None
+                ),
+                claim_slot=lambda slot: claim_slot_for_account(
+                    coordinator,
+                    account.key,
+                    slot,
+                ),
+            )
+            progress.completed_times.add(start_time)
+            if phase_result is not None:
+                if not claim_slot_for_account(
+                    coordinator,
+                    account.key,
+                    phase_result.slot,
+                ):
+                    raise AssertionError(
+                        f"{account.label} returned a result for {phase_result.slot.label} "
+                        "without owning the coordinated slot claim."
+                    )
+                last_result = phase_result
+            else:
+                publish_phase_selection(
+                    coordinator,
+                    account.key,
+                    start_time,
+                    None,
+                )
+            if booking_attempt_succeeded(phase_result):
+                break
+
+        if not config.dry_run and not booking_attempt_succeeded(last_result):
+            await log_available_spaces_diagnostics_best_effort(
+                page,
+                config,
+                account,
+                logger,
+            )
+
+        if config.debug_pause_seconds > 0:
+            logger.info(
+                "DEBUG_PAUSE_SECONDS=%s so pausing on the available spaces page.",
+                config.debug_pause_seconds,
+            )
+            await page.wait_for_timeout(config.debug_pause_seconds * 1000)
+        return last_result
+    except Exception:
+        if page is not None:
+            await save_failure_screenshot(
+                page,
+                f"{account.label}-session-{attempt_number}-failure",
+                config.timezone_name,
+                logger,
+            )
+        raise
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+                logger.info("Page closed for session attempt %s.", attempt_number)
+            except PlaywrightError as exc:
+                logger.warning("Failed to close page cleanly: %s", exc)
+        if context is not None:
+            try:
+                await context.close()
+                logger.info("Browser context closed for session attempt %s.", attempt_number)
+            except PlaywrightError as exc:
+                logger.warning("Failed to close browser context cleanly: %s", exc)
 
 
 async def run_account_booking(
@@ -1490,148 +2243,82 @@ async def run_account_booking(
     coordinator: BookingCoordinator,
 ) -> int:
     logger = get_account_logger(base_logger, account)
-    prewarm_mode = should_use_midnight_prewarm(
-        timezone_name=config.timezone_name,
-        target_date_override=config.target_date_override,
+    progress = AccountRunProgress()
+    logger.info(
+        "HEADLESS=%s DRY_RUN=%s TIMEZONE=%s",
+        config.headless,
+        config.dry_run,
+        config.timezone_name,
     )
-    target_date: date | None = None
-    using_override = False
-    planned_target_date: date | None = None
-
-    logger.info("HEADLESS=%s DRY_RUN=%s TIMEZONE=%s", config.headless, config.dry_run, config.timezone_name)
-    if prewarm_mode:
-        planned_target_date = compute_target_date_after_next_local_midnight(config.timezone_name)
+    logger.info("Target booking date is %s", format_date_for_site(coordinator.target_date))
+    logger.info(
+        "Booking time order is %s; court order is %s.",
+        " -> ".join(get_account_attempt_times(account.key)),
+        " -> ".join(str(court) for court in account.court_priority),
+    )
+    if coordinator.release_at is not None:
         logger.info(
-            "Midnight prewarm mode is active. The script will log in before midnight and submit the search just after the London date rolls over."
+            "Midnight prewarm mode is active. Retries will keep the fixed target date %s.",
+            format_date_for_site(coordinator.target_date),
         )
-        logger.info(
-            "Planned post-midnight target booking date is %s",
-            format_date_for_site(planned_target_date),
+    if config.target_date_override:
+        logger.warning(
+            "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
+            format_date_for_site(coordinator.target_date),
         )
-    else:
-        target_date, using_override = resolve_target_date(
-            timezone_name=config.timezone_name,
-            target_date_override=config.target_date_override,
-        )
-        if using_override:
-            logger.warning(
-                "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
-                format_date_for_site(target_date),
-            )
-        logger.info("Target booking date is %s", format_date_for_site(target_date))
-    context = None
-    page = None
-    initial_phase_recorded = False
 
     try:
-        context = await browser.new_context(
-            locale="en-GB",
-            timezone_id=config.timezone_name,
-        )
-        page = await context.new_page()
-
-        booking_flow_started_at = perf_counter()
-        await login(page, config, account, logger)
-        logger.info(
-            "Timing | login page open -> login complete: %.2fs",
-            perf_counter() - booking_flow_started_at,
-        )
-        await open_booking_search(page, config, logger)
-        if prewarm_mode:
-            assert planned_target_date is not None
+        for attempt_number in range(1, MAX_ACCOUNT_SESSION_ATTEMPTS + 1):
             logger.info(
-                "Prewarming the booking search form for %s before midnight.",
-                format_date_for_site(planned_target_date),
+                "Starting browser session attempt %s/%s.",
+                attempt_number,
+                MAX_ACCOUNT_SESSION_ATTEMPTS,
             )
-            await prepare_badminton_search_form(page, planned_target_date, config, account, logger)
-            seconds_until_midnight = seconds_until_next_local_midnight(config.timezone_name)
-            if seconds_until_midnight > 0:
+            try:
+                booking_result = await run_account_booking_session(
+                    browser,
+                    config,
+                    account,
+                    logger,
+                    coordinator,
+                    progress,
+                    attempt_number,
+                )
+            except (
+                AccessBlockerError,
+                AuthenticationError,
+                BasketRecoveryError,
+                ValueError,
+                TypeError,
+                AssertionError,
+                KeyError,
+            ) as exc:
+                logger.exception("Booking run failed: %s", exc)
+                return 1
+            except Exception as exc:  # noqa: BLE001 - bounded recovery boundary
+                if attempt_number >= MAX_ACCOUNT_SESSION_ATTEMPTS:
+                    logger.exception(
+                        "Booking run failed: exhausted %s browser session attempts: %s",
+                        MAX_ACCOUNT_SESSION_ATTEMPTS,
+                        exc,
+                    )
+                    return 1
+                logger.exception(
+                    "Browser session attempt %s/%s failed: %s",
+                    attempt_number,
+                    MAX_ACCOUNT_SESSION_ATTEMPTS,
+                    exc,
+                )
                 logger.info(
-                    "Midnight prewarm mode is waiting %.2fs before submitting the search.",
-                    seconds_until_midnight,
+                    "Closing the failed session and retrying with a fresh login in %ss.",
+                    ACCOUNT_RETRY_DELAY_SECONDS,
                 )
-                wait_started_at = perf_counter()
-                await page.wait_for_timeout(int(seconds_until_midnight * 1000))
-                logger.info(
-                    "Timing | midnight prewarm wait before search: %.2fs",
-                    perf_counter() - wait_started_at,
-                )
-            target_date, using_override = resolve_target_date(
-                timezone_name=config.timezone_name,
-                target_date_override=config.target_date_override,
-            )
-            if using_override:
-                logger.warning(
-                    "TARGET_DATE_OVERRIDE is active. Using override date %s instead of Europe/London today + 8 days.",
-                    format_date_for_site(target_date),
-                )
-            logger.info("Target booking date is %s", format_date_for_site(target_date))
-            if target_date != planned_target_date:
-                logger.warning(
-                    "Post-midnight target date changed from prewarmed %s to %s. Updating the search form before submitting.",
-                    format_date_for_site(planned_target_date),
-                    format_date_for_site(target_date),
-                )
-                await prepare_badminton_search_form(page, target_date, config, account, logger)
-            await submit_badminton_search(page, config, logger)
-        else:
-            assert target_date is not None
-            await search_badminton(page, target_date, config, account, logger)
-        logger.info(
-            "Timing | login page open -> search submitted: %.2fs",
-            perf_counter() - booking_flow_started_at,
-        )
-        assert target_date is not None
-        await open_available_spaces(page, target_date, config, account, logger)
-        logger.info(
-            "Timing | login page open -> available spaces page opened: %.2fs",
-            perf_counter() - booking_flow_started_at,
-        )
-        initial_phase_preferences = build_account_slot_priority(
-            account,
-            get_initial_attempt_times(account.key),
-        )
-        logger.info(
-            "Initial booking phase targets: %s",
-            ", ".join(slot.label for slot in initial_phase_preferences),
-        )
-        booking_result = await book_best_available_slot(
-            page,
-            config,
-            account,
-            logger,
-            preferences=initial_phase_preferences,
-            phase_name="initial",
-            booking_flow_started_at=booking_flow_started_at,
-        )
-        await record_initial_phase_result(coordinator, account.key, booking_result)
-        initial_phase_recorded = True
-        await coordinator.follow_up_ready.wait()
+                await asyncio.sleep(ACCOUNT_RETRY_DELAY_SECONDS)
+                continue
 
-        follow_up_times = coordinator.follow_up_times_by_account.get(account.key, ())
-        if follow_up_times and not booking_attempt_succeeded(booking_result):
-            follow_up_preferences = build_account_slot_priority(account, follow_up_times)
-            logger.info(
-                "Follow-up booking phase targets: %s",
-                ", ".join(slot.label for slot in follow_up_preferences),
-            )
-            follow_up_result = await book_best_available_slot(
-                page,
-                config,
-                account,
-                logger,
-                preferences=follow_up_preferences,
-                phase_name="follow-up",
-            )
-            if follow_up_result is not None:
-                booking_result = follow_up_result
-        elif booking_attempt_succeeded(booking_result):
-            logger.info("Initial phase succeeded, so no follow-up phase is required.")
-        else:
-            logger.info("No follow-up phase is required after the initial phase.")
-
-        if booking_result:
-            if booking_result.outcome == "dry-run":
+            if booking_result is None:
+                logger.info("No preferred slots were available to book.")
+            elif booking_result.outcome == "dry-run":
                 logger.info("Success: would book %s", booking_result.slot.label)
             elif booking_result.outcome == "confirmed":
                 logger.info("Success: confirmed booking for %s", booking_result.slot.label)
@@ -1645,47 +2332,12 @@ async def run_account_booking(
                     "Booking was submitted for %s, but no explicit confirmation signal was detected. Verify it in the site.",
                     booking_result.slot.label,
                 )
-            if config.debug_pause_seconds > 0:
-                logger.info(
-                    "DEBUG_PAUSE_SECONDS=%s so pausing on the available spaces page.",
-                    config.debug_pause_seconds,
-                )
-                await page.wait_for_timeout(config.debug_pause_seconds * 1000)
             return 0
 
-        logger.info("No preferred slots were available to book.")
-        if config.debug_pause_seconds > 0:
-            logger.info(
-                "DEBUG_PAUSE_SECONDS=%s so pausing on the available spaces page.",
-                config.debug_pause_seconds,
-            )
-            await page.wait_for_timeout(config.debug_pause_seconds * 1000)
-        return 0
-    except (PlaywrightError, PlaywrightTimeoutError, RuntimeError, ValueError) as exc:
-        if not initial_phase_recorded:
-            await record_initial_phase_result(coordinator, account.key, None)
-        logger.exception("Booking run failed: %s", exc)
-        if page is not None:
-            await save_failure_screenshot(
-                page,
-                f"{account.label}-booking-failure",
-                config.timezone_name,
-                logger,
-            )
+        logger.error("Booking run failed: no browser session attempt was executed.")
         return 1
     finally:
-        if page is not None:
-            try:
-                await page.close()
-                logger.info("Page closed.")
-            except PlaywrightError as exc:
-                logger.warning("Failed to close page cleanly: %s", exc)
-        if context is not None:
-            try:
-                await context.close()
-                logger.info("Browser context closed.")
-            except PlaywrightError as exc:
-                logger.warning("Failed to close browser context cleanly: %s", exc)
+        release_remaining_account_phases(coordinator, account.key)
 
 
 async def run_booking() -> int:
@@ -1698,7 +2350,35 @@ async def run_booking() -> int:
     )
 
     browser = None
-    coordinator = BookingCoordinator(expected_accounts=len(config.accounts))
+    run_now = datetime.now(timezone.utc)
+    prewarm_mode = should_use_midnight_prewarm(
+        timezone_name=config.timezone_name,
+        target_date_override=config.target_date_override,
+        now=run_now,
+    )
+    release_at: datetime | None = None
+    if prewarm_mode:
+        local_now = get_local_now(config.timezone_name, now=run_now)
+        release_at = datetime.combine(
+            local_now.date() + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=local_now.tzinfo,
+        )
+        coordinator_target_date = compute_target_date_after_next_local_midnight(
+            config.timezone_name,
+            now=run_now,
+        )
+    else:
+        coordinator_target_date, _ = resolve_target_date(
+            timezone_name=config.timezone_name,
+            target_date_override=config.target_date_override,
+            now=run_now,
+        )
+    coordinator = BookingCoordinator(
+        target_date=coordinator_target_date,
+        release_at=release_at,
+    )
+    exit_code = 1
     async with async_playwright() as playwright:
         try:
             browser = await playwright.chromium.launch(headless=config.headless)
@@ -1709,8 +2389,9 @@ async def run_booking() -> int:
                 ]
             )
             if any(result != 0 for result in results):
-                return 1
-            return 0
+                exit_code = 1
+            else:
+                exit_code = 0
         finally:
             if browser is not None:
                 try:
@@ -1718,6 +2399,22 @@ async def run_booking() -> int:
                     logger.info("Browser closed.")
                 except PlaywrightError as exc:
                     logger.warning("Failed to close browser cleanly: %s", exc)
+
+    if email_notifications_enabled() and not config.dry_run:
+        try:
+            await asyncio.to_thread(
+                send_booking_report,
+                log_path,
+                LOGS_DIR,
+                config.timezone_name,
+                logger,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to send booking report email: %s", exc)
+    elif config.dry_run:
+        logger.info("Skipping booking report email because DRY_RUN=true.")
+
+    return exit_code
 
 
 def main() -> int:
