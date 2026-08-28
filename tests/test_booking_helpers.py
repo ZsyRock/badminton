@@ -403,6 +403,41 @@ def test_slot_claims_are_atomic_and_persist_across_account_retries():
     }
 
 
+def test_slot_claim_can_only_be_released_by_its_owner():
+    coordinator = book_badminton.BookingCoordinator(
+        target_date=date(2026, 8, 30)
+    )
+    slot = SlotPreference("18:00", 1)
+
+    assert book_badminton.claim_slot_for_account(
+        coordinator,
+        ACCOUNT_A_KEY,
+        slot,
+    )
+    assert not book_badminton.release_slot_for_account(
+        coordinator,
+        ACCOUNT_B_KEY,
+        slot,
+    )
+    assert coordinator.slot_claim_owners[slot] == ACCOUNT_A_KEY
+
+    assert book_badminton.release_slot_for_account(
+        coordinator,
+        ACCOUNT_A_KEY,
+        slot,
+    )
+    assert not book_badminton.release_slot_for_account(
+        coordinator,
+        ACCOUNT_A_KEY,
+        slot,
+    )
+    assert book_badminton.claim_slot_for_account(
+        coordinator,
+        ACCOUNT_B_KEY,
+        slot,
+    )
+
+
 def test_resolve_target_date_prefers_override_when_present():
     resolved, using_override = resolve_target_date(
         timezone_name="Europe/London",
@@ -693,6 +728,47 @@ def test_open_available_spaces_stops_on_wrong_calendar_date(monkeypatch):
     assert len(page.role_calls) == 1
 
 
+def test_rejection_refresh_stops_if_calendar_moves_to_wrong_date(monkeypatch):
+    config, _account, logger = make_test_booking_context()
+
+    class ReloadPage:
+        url = (
+            "https://example.test/book/calendar/activity?"
+            "activityDate=2026-08-30T15%3A00%3A00.000Z"
+        )
+
+        def __init__(self):
+            self.reload_count = 0
+
+        async def reload(self):
+            self.reload_count += 1
+
+    page = ReloadPage()
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_network_idle_best_effort",
+        no_op,
+    )
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_op)
+    monkeypatch.setattr(book_badminton, "wait_for_available_spaces_content", no_op)
+
+    with pytest.raises(book_badminton.TargetDateValidationError):
+        asyncio.run(
+            book_badminton.refresh_available_spaces_after_rejection(
+                page,
+                date(2026, 8, 31),
+                config,
+                logger,
+            )
+        )
+
+    assert page.reload_count == 1
+
+
 def test_open_available_spaces_never_falls_back_to_an_arbitrary_date(monkeypatch):
     config, account, logger = make_test_booking_context()
     page = AvailableSpacesTestPage(
@@ -795,6 +871,19 @@ def test_basket_state_detectors_match_added_and_conflict_messages():
     assert not book_badminton.basket_item_added_detected(
         "Booking Confirmed!"
     )
+
+
+def test_lease_creation_error_count_is_normalized_and_exact():
+    body_text = """
+    ACTIVITY-CALENDAR.ERRORS.CREATE-LEASE
+    activity-calendar.errors.create-lease
+    ACTIVITY-CALENDAR.ERRORS.UNRELATED
+    """
+
+    assert book_badminton.lease_creation_error_count(body_text) == 2
+    assert book_badminton.lease_creation_error_count(
+        "Booking Confirmed!"
+    ) == 0
 
 
 def test_basket_contains_expected_slot_requires_activity_date_court_and_time():
@@ -1062,6 +1151,123 @@ def test_book_best_available_slot_stops_after_basket_recovery_confirms(monkeypat
     assert attempted_slots == [("19:00", 1)]
 
 
+def test_book_best_available_slot_releases_rejected_claim_and_tries_next_court(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    attempted_slots = []
+    released_slots = []
+    refresh_calls = []
+
+    async def visible_slots(*_args, **_kwargs):
+        return [
+            "19:00 Jubilee Court 1",
+            "19:00 Jubilee Court 2",
+        ]
+
+    async def reject_then_confirm(
+        _page,
+        start_time,
+        court_number,
+        *_args,
+        **_kwargs,
+    ):
+        attempted_slots.append((start_time, court_number))
+        if court_number == 1:
+            return "lease-rejected"
+        return "confirmed"
+
+    async def record_refresh(*_args, **_kwargs):
+        refresh_calls.append(True)
+
+    def release_slot(slot):
+        released_slots.append(slot)
+        return True
+
+    monkeypatch.setattr(book_badminton, "list_visible_bookable_slots", visible_slots)
+    monkeypatch.setattr(book_badminton, "try_book_slot", reject_then_confirm)
+    monkeypatch.setattr(
+        book_badminton,
+        "refresh_available_spaces_after_rejection",
+        record_refresh,
+    )
+
+    result = asyncio.run(
+        book_badminton.book_best_available_slot(
+            StubPage(),
+            config,
+            account,
+            logger,
+            target_date=date(2026, 8, 11),
+            preferences=(
+                SlotPreference("19:00", 1),
+                SlotPreference("19:00", 2),
+            ),
+            phase_name="19:00",
+            release_slot=release_slot,
+        )
+    )
+
+    assert result == BookingAttemptResult(
+        slot=SlotPreference("19:00", 2),
+        outcome="confirmed",
+    )
+    assert attempted_slots == [("19:00", 1), ("19:00", 2)]
+    assert released_slots == [SlotPreference("19:00", 1)]
+    assert refresh_calls == [True]
+
+
+def test_book_best_available_slot_preserves_claim_and_stops_for_unknown_state(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    attempted_slots = []
+    released_slots = []
+
+    async def visible_slots(*_args, **_kwargs):
+        return [
+            "19:00 Jubilee Court 1",
+            "19:00 Jubilee Court 2",
+        ]
+
+    async def unknown_final_state(
+        _page,
+        start_time,
+        court_number,
+        *_args,
+        **_kwargs,
+    ):
+        attempted_slots.append((start_time, court_number))
+        raise book_badminton.BasketRecoveryError("unknown final state")
+
+    def release_slot(slot):
+        released_slots.append(slot)
+        return True
+
+    monkeypatch.setattr(book_badminton, "list_visible_bookable_slots", visible_slots)
+    monkeypatch.setattr(book_badminton, "try_book_slot", unknown_final_state)
+
+    with pytest.raises(book_badminton.BasketRecoveryError):
+        asyncio.run(
+            book_badminton.book_best_available_slot(
+                StubPage(),
+                config,
+                account,
+                logger,
+                target_date=date(2026, 8, 11),
+                preferences=(
+                    SlotPreference("19:00", 1),
+                    SlotPreference("19:00", 2),
+                ),
+                phase_name="19:00",
+                release_slot=release_slot,
+            )
+        )
+
+    assert attempted_slots == [("19:00", 1)]
+    assert released_slots == []
+
+
 def test_book_best_available_slot_never_clicks_a_court_claimed_by_another_account(
     monkeypatch,
 ):
@@ -1176,6 +1382,288 @@ def test_try_book_slot_treats_plain_unavailable_final_button_timeout_as_recovera
 
     assert outcome == "unconfirmed"
     assert close_calls == [True]
+
+
+def test_confirmation_wait_stops_early_for_new_lease_creation_error(monkeypatch):
+    config, account, logger = make_test_booking_context()
+    page = StubPage(
+        locators={
+            "body": StubLocator(
+                text="ACTIVITY-CALENDAR.ERRORS.CREATE-LEASE"
+            )
+        },
+        url="https://example.test/book/calendar?activityDate=2026-08-11T00:00:00Z",
+    )
+    diagnostic_calls = []
+    screenshot_calls = []
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def record_diagnostics(*_args, **_kwargs):
+        diagnostic_calls.append(True)
+        return False
+
+    async def record_screenshot(*_args, **_kwargs):
+        screenshot_calls.append(True)
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "log_post_confirmation_state",
+        record_diagnostics,
+    )
+    monkeypatch.setattr(book_badminton, "save_named_screenshot", record_screenshot)
+
+    detected = asyncio.run(
+        book_badminton.wait_for_booking_confirmation_page(
+            page,
+            SlotPreference("19:00", 1),
+            config,
+            account,
+            logger,
+            lease_error_baseline=0,
+        )
+    )
+
+    assert not detected
+    assert diagnostic_calls == [True]
+    assert screenshot_calls == [True]
+
+
+def test_confirmation_wins_when_success_page_contains_stale_lease_error(monkeypatch):
+    config, account, logger = make_test_booking_context()
+    page = StubPage(
+        locators={
+            "body": StubLocator(
+                text=(
+                    "Booking Confirmed!\nBooking ref: 123456\n"
+                    "ACTIVITY-CALENDAR.ERRORS.CREATE-LEASE"
+                )
+            )
+        },
+        url="https://example.test/book/success?salesInvoiceIds=123456",
+    )
+    diagnostic_calls = []
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def record_diagnostics(*_args, **_kwargs):
+        diagnostic_calls.append(True)
+        return True
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "log_post_confirmation_state",
+        record_diagnostics,
+    )
+
+    detected = asyncio.run(
+        book_badminton.wait_for_booking_confirmation_page(
+            page,
+            SlotPreference("19:00", 1),
+            config,
+            account,
+            logger,
+            lease_error_baseline=0,
+        )
+    )
+
+    assert detected
+    assert diagnostic_calls == [True]
+
+
+def test_try_book_slot_treats_new_create_lease_error_as_definitive_rejection(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    initial_button = StubLocator()
+    final_button = StubLocator()
+    page = StubPage()
+    lease_counts = iter((0, 1))
+    close_calls = []
+
+    async def visible_slot(*_args, **_kwargs):
+        return initial_button
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def find_final(*_args, **_kwargs):
+        return final_button
+
+    async def no_confirmation(*_args, **_kwargs):
+        return False
+
+    async def no_basket_state(*_args, **_kwargs):
+        return None
+
+    async def read_lease_count(*_args, **_kwargs):
+        return next(lease_counts)
+
+    async def record_close(*_args, **_kwargs):
+        close_calls.append(True)
+
+    monkeypatch.setattr(book_badminton, "get_visible_slot_button", visible_slot)
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(book_badminton, "find_final_book_button", find_final)
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_booking_confirmation_page",
+        no_confirmation,
+    )
+    monkeypatch.setattr(
+        book_badminton,
+        "recover_basket_state_if_present",
+        no_basket_state,
+    )
+    monkeypatch.setattr(
+        book_badminton,
+        "read_lease_creation_error_count",
+        read_lease_count,
+    )
+    monkeypatch.setattr(book_badminton, "close_open_slot_panel", record_close)
+
+    outcome = asyncio.run(
+        book_badminton.try_book_slot(
+            page,
+            "19:00",
+            1,
+            date(2026, 8, 11),
+            config,
+            account,
+            logger,
+        )
+    )
+
+    assert outcome == "lease-rejected"
+    assert final_button.click_count == 1
+    assert close_calls == [True]
+
+
+def test_try_book_slot_recovers_new_lease_rejection_when_final_click_raises(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+
+    def raise_click_error():
+        raise book_badminton.PlaywrightError("click response was interrupted")
+
+    final_button = StubLocator(on_click=raise_click_error)
+    page = StubPage()
+    lease_counts = iter((0, 1))
+    close_calls = []
+
+    async def visible_slot(*_args, **_kwargs):
+        return StubLocator()
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def find_final(*_args, **_kwargs):
+        return final_button
+
+    async def no_basket_state(*_args, **_kwargs):
+        return None
+
+    async def read_lease_count(*_args, **_kwargs):
+        return next(lease_counts)
+
+    async def record_close(*_args, **_kwargs):
+        close_calls.append(True)
+
+    monkeypatch.setattr(book_badminton, "get_visible_slot_button", visible_slot)
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(book_badminton, "find_final_book_button", find_final)
+    monkeypatch.setattr(
+        book_badminton,
+        "recover_basket_state_if_present",
+        no_basket_state,
+    )
+    monkeypatch.setattr(
+        book_badminton,
+        "read_lease_creation_error_count",
+        read_lease_count,
+    )
+    monkeypatch.setattr(book_badminton, "close_open_slot_panel", record_close)
+
+    outcome = asyncio.run(
+        book_badminton.try_book_slot(
+            page,
+            "19:00",
+            1,
+            date(2026, 8, 11),
+            config,
+            account,
+            logger,
+        )
+    )
+
+    assert outcome == "lease-rejected"
+    assert final_button.click_count == 1
+    assert close_calls == [True]
+
+
+def test_try_book_slot_does_not_treat_stale_lease_error_as_current_rejection(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    final_button = StubLocator()
+    page = StubPage()
+
+    async def visible_slot(*_args, **_kwargs):
+        return StubLocator()
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def find_final(*_args, **_kwargs):
+        return final_button
+
+    async def no_confirmation(*_args, **_kwargs):
+        return False
+
+    async def no_basket_state(*_args, **_kwargs):
+        return None
+
+    async def stale_lease_count(*_args, **_kwargs):
+        return 1
+
+    monkeypatch.setattr(book_badminton, "get_visible_slot_button", visible_slot)
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(book_badminton, "find_final_book_button", find_final)
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_booking_confirmation_page",
+        no_confirmation,
+    )
+    monkeypatch.setattr(
+        book_badminton,
+        "recover_basket_state_if_present",
+        no_basket_state,
+    )
+    monkeypatch.setattr(
+        book_badminton,
+        "read_lease_creation_error_count",
+        stale_lease_count,
+    )
+
+    with pytest.raises(book_badminton.BasketRecoveryError):
+        asyncio.run(
+            book_badminton.try_book_slot(
+                page,
+                "19:00",
+                1,
+                date(2026, 8, 11),
+                config,
+                account,
+                logger,
+            )
+        )
+
+    assert final_button.click_count == 1
 
 
 def test_try_book_slot_keeps_normal_direct_confirmation_path_unchanged(monkeypatch):

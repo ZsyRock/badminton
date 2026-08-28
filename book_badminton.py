@@ -63,6 +63,7 @@ ACCOUNT_ATTEMPT_TIMES = {
 SUCCESSFUL_BOOKING_OUTCOMES = {"confirmed", "dry-run"}
 BASKET_ITEM_ADDED_TEXT = "added to basket"
 BASKET_SLOT_CONFLICT_TEXT = "you already have a booking for this slot in your basket"
+LEASE_CREATION_ERROR_TEXT = "activity-calendar.errors.create-lease"
 
 
 @dataclass(frozen=True)
@@ -528,6 +529,12 @@ def basket_item_added_detected(body_text: str) -> bool:
 
 def basket_slot_conflict_detected(body_text: str) -> bool:
     return BASKET_SLOT_CONFLICT_TEXT in " ".join(body_text.split()).lower()
+
+
+def lease_creation_error_count(body_text: str) -> int:
+    """Count the site's explicit temporary-reservation failure marker."""
+
+    return " ".join(body_text.split()).lower().count(LEASE_CREATION_ERROR_TEXT)
 
 
 def basket_contains_expected_slot(
@@ -1459,6 +1466,7 @@ async def wait_for_booking_confirmation_page(
     account: BookingAccountConfig,
     logger: logging.Logger,
     timeout_ms: int = 20_000,
+    lease_error_baseline: int | None = None,
 ) -> bool:
     logger.info("Waiting for booking confirmation page for %s", slot.label)
     deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
@@ -1474,6 +1482,24 @@ async def wait_for_booking_confirmation_page(
             logger.info("Detected booking confirmation page for %s", slot.label)
             await log_post_confirmation_state(page, slot, logger, body_text=body_text)
             return True
+
+        if (
+            lease_error_baseline is not None
+            and lease_creation_error_count(body_text) > lease_error_baseline
+        ):
+            logger.warning(
+                "The site explicitly rejected temporary reservation creation for %s; "
+                "stopping the confirmation wait early.",
+                slot.label,
+            )
+            await log_post_confirmation_state(page, slot, logger, body_text=body_text)
+            await save_named_screenshot(
+                page,
+                f"{account.label}-lease-rejected-{slot.start_time}-court-{slot.court_number}",
+                config.timezone_name,
+                logger,
+            )
+            return False
 
         await page.wait_for_timeout(250)
 
@@ -1495,6 +1521,19 @@ async def read_page_body_text(page: Page, timeout_ms: int = 5_000) -> str:
         return ""
 
 
+async def read_lease_creation_error_count(
+    page: Page,
+    timeout_ms: int = 2_000,
+) -> int | None:
+    """Return the current lease-error count, or None when the page is unreadable."""
+
+    try:
+        body_text = await page.locator("body").inner_text(timeout=timeout_ms)
+    except PlaywrightError:
+        return None
+    return lease_creation_error_count(body_text)
+
+
 async def wait_for_network_idle_best_effort(
     page: Page,
     logger: logging.Logger,
@@ -1508,6 +1547,33 @@ async def wait_for_network_idle_best_effort(
             "Network did not reach idle after %s; continuing with visible page-state checks.",
             description,
         )
+
+
+async def refresh_available_spaces_after_rejection(
+    page: Page,
+    target_date: date,
+    config: AppConfig,
+    logger: logging.Logger,
+) -> None:
+    """Clear stale SPA errors and revalidate the booking date before continuing."""
+
+    logger.info(
+        "Refreshing available spaces after an explicit lease rejection for %s.",
+        format_date_for_site(target_date),
+    )
+    await page.reload()
+    await wait_for_network_idle_best_effort(
+        page,
+        logger,
+        "refreshing after an explicit lease rejection",
+    )
+    await check_for_access_blockers(page, config, logger)
+    await wait_for_available_spaces_content(page, config, logger)
+    validate_calendar_target_date(page.url, target_date, config.timezone_name)
+    logger.info(
+        "Revalidated available-spaces calendar date after lease rejection: %s",
+        format_date_for_site(target_date),
+    )
 
 
 async def recover_pending_basket_booking(
@@ -1693,6 +1759,7 @@ async def recover_or_stop_after_unknown_final_action(
     account: BookingAccountConfig,
     logger: logging.Logger,
     cause: Exception,
+    lease_error_baseline: int | None = None,
 ) -> str:
     try:
         recovered_outcome = await recover_basket_state_if_present(
@@ -1714,6 +1781,22 @@ async def recover_or_stop_after_unknown_final_action(
 
     if recovered_outcome is not None:
         return recovered_outcome
+
+    post_submit_lease_error_count = await read_lease_creation_error_count(page)
+    if (
+        lease_error_baseline is not None
+        and post_submit_lease_error_count is not None
+        and post_submit_lease_error_count > lease_error_baseline
+    ):
+        logger.warning(
+            "The final click for %s raised an error, but the site explicitly rejected "
+            "temporary reservation creation and no confirmation or basket item exists; "
+            "continuing safely.",
+            slot.label,
+        )
+        await close_open_slot_panel(page, slot, logger)
+        return "lease-rejected"
+
     raise BasketRecoveryError(
         f"The final booking action for {slot.label} ended in an unknown state. "
         "Stopping to avoid a duplicate booking."
@@ -1826,6 +1909,14 @@ async def try_book_slot(
             return "unconfirmed"
         raise
 
+    lease_error_baseline = await read_lease_creation_error_count(page)
+    if lease_error_baseline is None:
+        logger.warning(
+            "Could not establish the pre-submit lease-error state for %s; any "
+            "unconfirmed result will retain the existing duplicate-booking safety stop.",
+            slot.label,
+        )
+
     try:
         await final_button.click()
     except Exception as exc:  # noqa: BLE001 - click may already have reached the site
@@ -1837,6 +1928,7 @@ async def try_book_slot(
             account,
             logger,
             exc,
+            lease_error_baseline=lease_error_baseline,
         )
     logger.info("Clicked final Book Badminton confirmation for %s", slot.label)
     try:
@@ -1854,6 +1946,7 @@ async def try_book_slot(
             config,
             account,
             logger,
+            lease_error_baseline=lease_error_baseline,
         )
         if confirmation_detected:
             return "confirmed"
@@ -1868,6 +1961,20 @@ async def try_book_slot(
         )
         if recovered_outcome is not None:
             return recovered_outcome
+
+        post_submit_lease_error_count = await read_lease_creation_error_count(page)
+        if (
+            lease_error_baseline is not None
+            and post_submit_lease_error_count is not None
+            and post_submit_lease_error_count > lease_error_baseline
+        ):
+            logger.warning(
+                "The site explicitly rejected temporary reservation creation for %s, "
+                "and no confirmation or basket item exists; continuing safely.",
+                slot.label,
+            )
+            await close_open_slot_panel(page, slot, logger)
+            return "lease-rejected"
 
         if await current_slot_is_unavailable(page, slot):
             logger.info(
@@ -1894,6 +2001,7 @@ async def try_book_slot(
             account,
             logger,
             exc,
+            lease_error_baseline=lease_error_baseline,
         )
 
 
@@ -1907,6 +2015,7 @@ async def book_best_available_slot(
     phase_name: str,
     booking_flow_started_at: float | None = None,
     claim_slot: Callable[[SlotPreference], bool] | None = None,
+    release_slot: Callable[[SlotPreference], bool] | None = None,
 ) -> BookingAttemptResult | None:
     if not preferences:
         logger.info("No slot preferences were configured for the %s phase.", phase_name)
@@ -1940,12 +2049,30 @@ async def book_best_available_slot(
             logger,
             claim_slot,
         )
-        if outcome == "unconfirmed":
+        if outcome in {"unconfirmed", "lease-rejected"}:
+            if release_slot is not None and release_slot(slot):
+                logger.info(
+                    "Released the coordinated claim for %s after a definitive failed attempt.",
+                    slot.label,
+                )
             last_unconfirmed_slot = slot
-            logger.warning(
-                "No booking confirmation page was detected for %s, so continuing to the next preferred slot.",
-                slot.label,
-            )
+            if outcome == "lease-rejected":
+                logger.warning(
+                    "Temporary reservation creation was explicitly rejected for %s; "
+                    "refreshing and continuing to the next preferred slot.",
+                    slot.label,
+                )
+                await refresh_available_spaces_after_rejection(
+                    page,
+                    target_date,
+                    config,
+                    logger,
+                )
+            else:
+                logger.warning(
+                    "No booking confirmation page was detected for %s, so continuing to the next preferred slot.",
+                    slot.label,
+                )
             continue
         if outcome is not None:
             return BookingAttemptResult(slot=slot, outcome=outcome)
@@ -2030,6 +2157,19 @@ def claim_slot_for_account(
         slot.start_time,
         slot,
     )
+    return True
+
+
+def release_slot_for_account(
+    coordinator: BookingCoordinator,
+    account_key: str,
+    slot: SlotPreference,
+) -> bool:
+    """Release an exact-slot claim only when it is owned by this account."""
+
+    if coordinator.slot_claim_owners.get(slot) != account_key:
+        return False
+    del coordinator.slot_claim_owners[slot]
     return True
 
 
@@ -2173,18 +2313,25 @@ async def run_account_booking_session(
                     account.key,
                     slot,
                 ),
+                release_slot=lambda slot: release_slot_for_account(
+                    coordinator,
+                    account.key,
+                    slot,
+                ),
             )
             progress.completed_times.add(start_time)
             if phase_result is not None:
-                if not claim_slot_for_account(
-                    coordinator,
-                    account.key,
-                    phase_result.slot,
-                ):
-                    raise AssertionError(
-                        f"{account.label} returned a result for {phase_result.slot.label} "
-                        "without owning the coordinated slot claim."
-                    )
+                if booking_attempt_succeeded(phase_result):
+                    if not claim_slot_for_account(
+                        coordinator,
+                        account.key,
+                        phase_result.slot,
+                    ):
+                        raise AssertionError(
+                            f"{account.label} returned a successful result for "
+                            f"{phase_result.slot.label} without owning the coordinated "
+                            "slot claim."
+                        )
                 last_result = phase_result
             else:
                 publish_phase_selection(

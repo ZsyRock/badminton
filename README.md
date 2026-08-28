@@ -13,7 +13,9 @@ Python Playwright automation for booking badminton courts on Southampton Sport G
 - All three accounts use a shared exact-slot claim registry, including the
   common `20:00` fallback, so they do not race one another for the same Court
 - Stop after the first slot that reaches `Booking Confirmed!`
-- If a slot does not confirm, continue to the next preferred slot
+- If the site explicitly rejects creation of its temporary slot reservation,
+  release that internal slot claim, refresh and revalidate the target date, then
+  continue to the next preferred Court
 - `DRY_RUN=true` never clicks the final confirmation button
 - A transient stuck session is closed and re-created with a fresh login, with no
   more than three total session attempts per account
@@ -152,6 +154,13 @@ zero-price Basket → Checkout → Confirm flow. It verifies that the basket con
 exactly one item matching the attempted Court and time before confirming. If the
 basket state is ambiguous, that account stops safely instead of risking a duplicate
 booking or blindly moving to another Court.
+
+If Gladstone explicitly returns `ACTIVITY-CALENDAR.ERRORS.CREATE-LEASE` only after
+the current final click, and a second state check finds neither a confirmation nor
+an expected basket item, the script treats that submission as rejected. It releases
+only that account's exact-slot claim, refreshes the calendar, revalidates the target
+date, and continues in the configured Court and fallback-time order. A stale error
+left by an earlier SPA action is not treated as a new rejection.
 
 For page timeouts or other transient browser failures before an ambiguous final
 submission, the failed page and browser context are closed and the account logs in
