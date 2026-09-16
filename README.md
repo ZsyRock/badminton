@@ -5,13 +5,18 @@ Python Playwright automation for booking badminton courts on Southampton Sport G
 ## Production Rules
 
 - Target date = current `Europe/London` date + 8 days
-- `账号A`: `18:00 → 16:00 → 20:00`, Court `1 → 2 → 3 → 4`
-- `账号B`: `18:00 → 16:00 → 20:00`, Court `2 → 1 → 3 → 4`
-- `账号C`: `17:00 → 19:00 → 20:00`, Court `1 → 2 → 3 → 4`
-- For each shared A/B time, B waits only until A selects and claims a Court,
-  then immediately proceeds while skipping that exact slot
-- All three accounts use a shared exact-slot claim registry, including the
-  common `20:00` fallback, so they do not race one another for the same Court
+- Primary wave: `账号C` targets `17:00`, while `账号A` and `账号B` target
+  separate Courts at `18:00`; this aims for one `17:00` slot plus two `18:00`
+  slots
+- `账号A` and `账号C` use Court order `1 → 2 → 3 → 4`; `账号B` uses
+  `2 → 1 → 3 → 4` and skips the exact `18:00` Court already selected by A
+- If the primary wave is incomplete, an unbooked account dynamically fills an
+  adjacent time. The scheduler first preserves a consecutive two-hour block,
+  then prefers a third `19:00` slot over `16:00`, and finally uses the remaining
+  target hours down to `15:00`
+- An isolated `15:00` slot remains an allowed last-resort booking
+- All three accounts share time-and-Court claims so concurrent primary and
+  fallback attempts do not race one another for the same slot
 - Stop after the first slot that reaches `Booking Confirmed!`
 - If the site explicitly rejects creation of its temporary slot reservation,
   release that internal slot claim, refresh and revalidate the target date, then
@@ -81,17 +86,17 @@ HEADLESS=true
 DRY_RUN=false
 TARGET_DATE_OVERRIDE=
 DEBUG_PAUSE_SECONDS=
-PREFERRED_TIMES=18:00,16:00,20:00
+PREFERRED_TIMES=15:00,16:00,17:00,18:00,19:00
 PREFERRED_COURTS=1,2,3,4
 SECONDARY_BOOKING_ENABLED=false
 SECONDARY_GYM_USERNAME=
 SECONDARY_GYM_PASSWORD=
-SECONDARY_PREFERRED_TIMES=18:00,16:00,20:00
+SECONDARY_PREFERRED_TIMES=15:00,16:00,17:00,18:00,19:00
 SECONDARY_PREFERRED_COURTS=2,1,3,4
 TERTIARY_BOOKING_ENABLED=false
 TERTIARY_GYM_USERNAME=
 TERTIARY_GYM_PASSWORD=
-TERTIARY_PREFERRED_TIMES=17:00,19:00,20:00
+TERTIARY_PREFERRED_TIMES=15:00,16:00,17:00,18:00,19:00
 TERTIARY_PREFERRED_COURTS=1,2,3,4
 BOOKING_EMAIL_ENABLED=false
 BOOKING_EMAIL_REFERENCE_SCRIPT=/home/<YOUR_USERNAME>/send_ip_email.py
@@ -119,10 +124,13 @@ Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_S
 - `BOOKING_EMAIL_FROM`, `BOOKING_EMAIL_APP_PASSWORD`, `BOOKING_EMAIL_APP_PASSWORD_FILE`, `BOOKING_EMAIL_TO`: optional explicit SMTP settings that take precedence over the reference script; the password-file option keeps the secret outside `.env`, and multiple recipients are comma-separated
 
 The daily email contains a one-sentence English summary of the current run and a
-schedule from the current date through the latest confirmed booking date reconstructed
-from `logs/`. Its table covers 16:00 through 20:00; consecutive booked cells are
-light green and isolated booked cells are light yellow. Keep booking logs if you want
-historical bookings to remain in the table.
+schedule from the current date through the latest attempted or confirmed booking
+date reconstructed from `logs/`. Its table covers 15:00 through 19:00 only; consecutive
+booked cells are light green and isolated booked cells are light yellow. A target
+date where no account secured a slot remains visible, with an em dash in every empty
+time cell.
+Keep booking logs if you want historical attempts and bookings to remain in the
+table.
 
 Optional local corrections can be stored in `manual_bookings.json`. This runtime
 data file is intentionally excluded from Git so personal booking history is not
@@ -131,12 +139,14 @@ published with the source code.
 Each booked slot is displayed as plain `Court N` text. The report does not add a
 calendar link, hidden event metadata, or calendar attachment to booked cells.
 
-The same rules apply to every target weekday. Each account moves to its next time
-only if it has not secured a booking. A and C use Court order `1, 2, 3, 4`; B uses
-`2, 1, 3, 4`. B waits for A's Court selection at each shared time (`18:00`,
-`16:00`, `20:00`) but no longer waits for the full confirmation page. Exact-slot
-claims are shared by A, B, and C, so the common `20:00` fallback also avoids
-same-Court races.
+The same rules apply to every target weekday. In the primary wave C targets
+`17:00`, while A gets first choice at `18:00` and B targets a different `18:00`
+Court. B waits only for A's Court selection, not for A's full confirmation page.
+If that ideal shape cannot be completed, unbooked accounts dynamically choose
+from `15:00` through `19:00` to preserve a consecutive pair. Once there is only
+one Court in each hour of a consecutive pair, `19:00` is preferred over `16:00`
+for the third booking. An isolated `15:00` is still accepted as a final fallback.
+Shared claims prevent two accounts from selecting the same time-and-Court slot.
 
 The available-spaces result must match the requested date twice: the script only
 clicks the exact dated result and then verifies the calendar URL's `activityDate`
@@ -146,7 +156,9 @@ times are exhausted (or during `DRY_RUN`), not before a successful production
 booking attempt.
 
 The preferred-time settings control the search window used before opening available
-spaces. The code automatically adds every time required by the fixed account plan.
+spaces. Configure all three accounts with the complete `15:00` through `19:00`
+window; the coordinator, rather than the order of that comma-separated value,
+chooses each account's primary and fallback attempts.
 
 If the site adds a selected slot to the basket but does not reach the normal success
 page, the script preserves the original Court choice and completes the site's

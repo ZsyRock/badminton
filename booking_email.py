@@ -20,6 +20,7 @@ ACCOUNT_LABELS = ("账号A", "账号B", "账号C")
 ACCOUNT_LABEL_PATTERN = r"账号[ABC]"
 DEFAULT_TIMEZONE = "Europe/London"
 MANUAL_BOOKINGS_FILENAME = "manual_bookings.json"
+REPORT_TIMES = ("15:00", "16:00", "17:00", "18:00", "19:00")
 TARGET_DATE_PATTERN = re.compile(
     rf"\[({ACCOUNT_LABEL_PATTERN})\].*Target booking date is (\d{{2}}/\d{{2}}/\d{{4}})"
 )
@@ -33,6 +34,7 @@ FAILURE_PATTERN = re.compile(
 NO_SLOT_PATTERN = re.compile(
     rf"\[({ACCOUNT_LABEL_PATTERN})\].*No preferred slots were available to book\."
 )
+DRY_RUN_ENABLED_PATTERN = re.compile(r"\bDRY_RUN\s*=\s*True\b", re.IGNORECASE)
 LEGACY_TARGET_DATE_PATTERN = re.compile(r"Target booking date is (\d{2}/\d{2}/\d{4})")
 LEGACY_SUCCESS_PATTERN = re.compile(
     r"Success: confirmed booking for (\d{2}:\d{2}) Jubilee Court (\d+)"
@@ -353,6 +355,26 @@ def collect_confirmed_bookings(
     return _latest_booking_per_account_and_date(collected)
 
 
+def collect_attempted_booking_dates(logs_dir: Path) -> tuple[date, ...]:
+    """Collect real-run target dates even when no account secured a slot."""
+
+    attempted_dates: set[date] = set()
+    for log_path in sorted(logs_dir.glob("book-badminton-*.log")):
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            if DRY_RUN_ENABLED_PATTERN.search(log_text):
+                continue
+            run_results = parse_run_log(log_path)
+        except (OSError, ValueError):
+            continue
+        attempted_dates.update(
+            result.target_date
+            for result in run_results
+            if result.target_date is not None
+        )
+    return tuple(sorted(attempted_dates))
+
+
 def _bookings_by_date_and_time(
     bookings: Iterable[ConfirmedBooking],
 ) -> dict[date, dict[str, list[ConfirmedBooking]]]:
@@ -501,24 +523,35 @@ def build_report(
     confirmed_bookings: tuple[ConfirmedBooking, ...],
     report_date: date,
     timezone_name: str = DEFAULT_TIMEZONE,
+    attempted_booking_dates: Iterable[date] = (),
 ) -> tuple[str, str, str]:
     confirmed_bookings = _latest_booking_per_account_and_date(confirmed_bookings)
     grouped = _bookings_by_date_and_time(confirmed_bookings)
-    future_booking_dates = [
+    future_schedule_dates = [
         booking.booking_date
         for booking in confirmed_bookings
         if booking.booking_date >= report_date
     ]
-    latest_booking_date = max(future_booking_dates, default=report_date)
+    future_schedule_dates.extend(
+        attempted_date
+        for attempted_date in attempted_booking_dates
+        if attempted_date >= report_date
+    )
+    future_schedule_dates.extend(
+        result.target_date
+        for result in run_results
+        if result.target_date is not None and result.target_date >= report_date
+    )
+    latest_schedule_date = max(future_schedule_dates, default=report_date)
     subject = (
         f"[Badminton Booking Report] {report_date:%a %d %b} - "
-        f"{latest_booking_date:%a %d %b}"
+        f"{latest_schedule_date:%a %d %b}"
     )
     schedule_dates = [
         report_date + timedelta(days=offset)
-        for offset in range((latest_booking_date - report_date).days + 1)
+        for offset in range((latest_schedule_date - report_date).days + 1)
     ]
-    times = ("16:00", "17:00", "18:00", "19:00", "20:00")
+    times = REPORT_TIMES
 
     target_dates = [result.target_date for result in run_results if result.target_date]
     target_date = target_dates[0] if target_dates else None
@@ -647,12 +680,14 @@ def send_booking_report(
         logs_dir,
         manual_bookings_path=manual_bookings_path,
     )
+    attempted_booking_dates = collect_attempted_booking_dates(logs_dir)
     report_date = datetime.now(ZoneInfo(timezone_name)).date()
     subject, plain_body, html_body = build_report(
         run_results,
         confirmed_bookings,
         report_date,
         timezone_name,
+        attempted_booking_dates=attempted_booking_dates,
     )
 
     message = build_email_message(

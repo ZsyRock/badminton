@@ -275,9 +275,15 @@ def test_load_config_adds_secondary_and_tertiary_accounts_with_requested_default
     assert config.accounts[0].key == ACCOUNT_A_KEY
     assert config.accounts[1].key == ACCOUNT_B_KEY
     assert config.accounts[2].key == ACCOUNT_C_KEY
-    assert config.accounts[0].search_window_times == ("16:00", "18:00", "20:00")
-    assert config.accounts[1].search_window_times == ("16:00", "18:00", "20:00")
-    assert config.accounts[2].search_window_times == ("17:00", "19:00", "20:00")
+    assert config.accounts[0].search_window_times == (
+        "15:00",
+        "16:00",
+        "17:00",
+        "18:00",
+        "19:00",
+    )
+    assert config.accounts[1].search_window_times == config.accounts[0].search_window_times
+    assert config.accounts[2].search_window_times == config.accounts[0].search_window_times
     assert config.accounts[0].court_priority == (1, 2, 3, 4)
     assert config.accounts[1].court_priority == (2, 1, 3, 4)
     assert config.accounts[2].court_priority == (1, 2, 3, 4)
@@ -301,29 +307,52 @@ def test_load_config_disables_optional_accounts_when_flags_are_false(monkeypatch
 
 
 def test_account_attempt_times_are_fixed_for_every_target_weekday():
-    assert get_account_attempt_times(ACCOUNT_A_KEY) == ("18:00", "16:00", "20:00")
-    assert get_account_attempt_times(ACCOUNT_B_KEY) == ("18:00", "16:00", "20:00")
-    assert get_account_attempt_times(ACCOUNT_C_KEY) == ("17:00", "19:00", "20:00")
+    assert get_account_attempt_times(ACCOUNT_A_KEY) == (
+        "18:00",
+        "19:00",
+        "16:00",
+        "15:00",
+    )
+    assert get_account_attempt_times(ACCOUNT_B_KEY) == (
+        "18:00",
+        "19:00",
+        "16:00",
+        "15:00",
+    )
+    assert get_account_attempt_times(ACCOUNT_C_KEY) == (
+        "17:00",
+        "19:00",
+        "16:00",
+        "15:00",
+    )
+    assert all(
+        "20:00" not in get_account_attempt_times(account_key)
+        for account_key in (ACCOUNT_A_KEY, ACCOUNT_B_KEY, ACCOUNT_C_KEY)
+    )
 
 
 def test_build_search_window_times_always_includes_required_fallback_hours():
     assert build_search_window_times(ACCOUNT_A_KEY, ("19:00",)) == (
+        "15:00",
         "16:00",
-        "18:00",
-        "19:00",
-        "20:00",
-    )
-    assert build_search_window_times(ACCOUNT_B_KEY, ("21:00",)) == (
-        "16:00",
-        "18:00",
-        "20:00",
-        "21:00",
-    )
-    assert build_search_window_times(ACCOUNT_C_KEY, ("18:00",)) == (
         "17:00",
         "18:00",
         "19:00",
-        "20:00",
+    )
+    assert build_search_window_times(ACCOUNT_B_KEY, ("21:00",)) == (
+        "15:00",
+        "16:00",
+        "17:00",
+        "18:00",
+        "19:00",
+        "21:00",
+    )
+    assert build_search_window_times(ACCOUNT_C_KEY, ("18:00",)) == (
+        "15:00",
+        "16:00",
+        "17:00",
+        "18:00",
+        "19:00",
     )
 
 
@@ -333,7 +362,7 @@ def test_account_b_phase_excludes_the_exact_court_claimed_by_account_a():
         label="账号B",
         username="b@example.com",
         password="password",
-        search_window_times=("18:00", "16:00", "20:00"),
+        search_window_times=("15:00", "16:00", "17:00", "18:00", "19:00"),
         court_priority=(2, 1, 3, 4),
     )
     coordinator = book_badminton.BookingCoordinator(
@@ -369,8 +398,8 @@ def test_slot_claims_are_atomic_and_persist_across_account_retries():
     coordinator = book_badminton.BookingCoordinator(
         target_date=date(2026, 8, 30)
     )
-    court_1 = SlotPreference("20:00", 1)
-    court_2 = SlotPreference("20:00", 2)
+    court_1 = SlotPreference("19:00", 1)
+    court_2 = SlotPreference("19:00", 2)
 
     assert book_badminton.claim_slot_for_account(
         coordinator,
@@ -1907,10 +1936,7 @@ def test_transient_failure_uses_fresh_login_and_resumes_incomplete_phase(monkeyp
             return None
         if len(phase_calls) == 2:
             raise book_badminton.PlaywrightTimeoutError("page stopped responding")
-        return BookingAttemptResult(
-            slot=SlotPreference("19:00", 1),
-            outcome="confirmed",
-        )
+        return BookingAttemptResult(slot=preferences[0], outcome="confirmed")
 
     monkeypatch.setattr(book_badminton, "login", successful_login)
     monkeypatch.setattr(book_badminton, "open_booking_search", no_op)
@@ -1936,8 +1962,8 @@ def test_transient_failure_uses_fresh_login_and_resumes_incomplete_phase(monkeyp
     assert all(context.closed and context.page.closed for context in browser.contexts)
     assert [phase_name for phase_name, _ in phase_calls] == [
         "17:00",
-        "19:00",
-        "19:00",
+        "16:00",
+        "16:00",
     ]
     assert [slot.court_number for slot in phase_calls[-1][1]] == [1, 2, 3, 4]
 
@@ -1972,6 +1998,51 @@ def test_transient_failure_stops_after_three_fresh_sessions(monkeypatch):
     assert len(login_calls) == 3
     assert len(browser.contexts) == 3
     assert all(context.closed and context.page.closed for context in browser.contexts)
+
+
+def test_exhausted_fallback_retries_release_logical_time_reservation(monkeypatch):
+    config, account, coordinator, logger = make_retry_test_context(ACCOUNT_C_KEY)
+    browser = RetryTestBrowser()
+    phase_calls = []
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def fail_primary_then_break_fallback(*_args, **kwargs):
+        phase_calls.append(kwargs["phase_name"])
+        if kwargs["phase_name"] == "17:00":
+            return None
+        raise book_badminton.PlaywrightTimeoutError("fallback page stopped responding")
+
+    async def no_screenshot(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(book_badminton, "login", no_op)
+    monkeypatch.setattr(book_badminton, "open_booking_search", no_op)
+    monkeypatch.setattr(book_badminton, "search_badminton", no_op)
+    monkeypatch.setattr(book_badminton, "open_available_spaces", no_op)
+    monkeypatch.setattr(
+        book_badminton,
+        "book_best_available_slot",
+        fail_primary_then_break_fallback,
+    )
+    monkeypatch.setattr(book_badminton, "save_failure_screenshot", no_screenshot)
+    monkeypatch.setattr(book_badminton, "ACCOUNT_RETRY_DELAY_SECONDS", 0)
+
+    exit_code = asyncio.run(
+        book_badminton.run_account_booking(
+            browser,
+            config,
+            account,
+            logger,
+            coordinator,
+        )
+    )
+
+    assert exit_code == 1
+    assert phase_calls == ["17:00", "16:00", "16:00", "16:00"]
+    assert coordinator.fallback_time_owners == {}
+    assert coordinator.active_phase_times == {}
 
 
 def test_nonretryable_failure_stops_once_and_releases_account_b_waiters(monkeypatch):
@@ -2155,7 +2226,7 @@ def test_account_b_starts_after_a_claim_before_a_confirmation(monkeypatch):
     assert account_b_preferences[0] == SlotPreference("18:00", 2)
 
 
-def test_all_accounts_use_unique_claims_when_they_fall_back_to_20(monkeypatch):
+def test_failed_second_18_uses_19_before_16_and_15(monkeypatch):
     account_a = make_retry_test_context(ACCOUNT_A_KEY)[1]
     account_b = make_retry_test_context(ACCOUNT_B_KEY)[1]
     account_c = make_retry_test_context(ACCOUNT_C_KEY)[1]
@@ -2172,7 +2243,7 @@ def test_all_accounts_use_unique_claims_when_they_fall_back_to_20(monkeypatch):
         target_date=date(2026, 8, 30)
     )
     browser = RetryTestBrowser()
-    logger = logging.getLogger("shared-20-claim-test")
+    logger = logging.getLogger("coordinated-19-fallback-test")
     logger.handlers.clear()
     logger.addHandler(logging.NullHandler())
     selected_slots = {}
@@ -2180,9 +2251,13 @@ def test_all_accounts_use_unique_claims_when_they_fall_back_to_20(monkeypatch):
     async def no_op(*_args, **_kwargs):
         return None
 
-    async def fall_back_to_20(*args, **kwargs):
+    phase_calls = {account.key: [] for account in config.accounts}
+
+    async def book_primary_pair_then_fallback(*args, **kwargs):
         account = args[2]
-        if kwargs["phase_name"] != "20:00":
+        phase_name = kwargs["phase_name"]
+        phase_calls[account.key].append(phase_name)
+        if account.key == ACCOUNT_B_KEY and phase_name == "18:00":
             return None
         claim_slot = kwargs["claim_slot"]
         for slot in kwargs["preferences"]:
@@ -2198,7 +2273,7 @@ def test_all_accounts_use_unique_claims_when_they_fall_back_to_20(monkeypatch):
     monkeypatch.setattr(
         book_badminton,
         "book_best_available_slot",
-        fall_back_to_20,
+        book_primary_pair_then_fallback,
     )
 
     async def scenario():
@@ -2226,9 +2301,85 @@ def test_all_accounts_use_unique_claims_when_they_fall_back_to_20(monkeypatch):
         ACCOUNT_B_KEY,
         ACCOUNT_C_KEY,
     }
-    assert {slot.start_time for slot in selected_slots.values()} == {"20:00"}
+    assert selected_slots[ACCOUNT_A_KEY].start_time == "18:00"
+    assert selected_slots[ACCOUNT_C_KEY].start_time == "17:00"
+    assert selected_slots[ACCOUNT_B_KEY].start_time == "19:00"
+    assert phase_calls[ACCOUNT_B_KEY] == ["18:00", "19:00"]
+    assert all("20:00" not in calls for calls in phase_calls.values())
     assert len(set(selected_slots.values())) == 3
-    assert {slot.court_number for slot in selected_slots.values()} == {1, 2, 3}
+
+
+def test_all_failed_primary_hours_coordinate_15_and_16_with_a_duplicate_court(
+    monkeypatch,
+):
+    accounts = tuple(
+        make_retry_test_context(account_key)[1]
+        for account_key in (ACCOUNT_A_KEY, ACCOUNT_B_KEY, ACCOUNT_C_KEY)
+    )
+    config = book_badminton.AppConfig(
+        booking_url="https://example.test/account",
+        timezone_name="Europe/London",
+        headless=True,
+        dry_run=False,
+        debug_pause_seconds=0,
+        target_date_override=None,
+        accounts=accounts,
+    )
+    coordinator = book_badminton.BookingCoordinator(target_date=date(2026, 8, 30))
+    browser = RetryTestBrowser()
+    logger = logging.getLogger("coordinated-early-pair-test")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    selected_slots = {}
+    phase_calls = {account.key: [] for account in accounts}
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def fail_primaries_then_confirm_fallback(*args, **kwargs):
+        account = args[2]
+        phase_name = kwargs["phase_name"]
+        phase_calls[account.key].append(phase_name)
+        if phase_name == book_badminton.get_account_primary_time(account.key):
+            return None
+        for slot in kwargs["preferences"]:
+            if kwargs["claim_slot"](slot):
+                selected_slots[account.key] = slot
+                return BookingAttemptResult(slot, "confirmed")
+        return None
+
+    monkeypatch.setattr(book_badminton, "login", no_op)
+    monkeypatch.setattr(book_badminton, "open_booking_search", no_op)
+    monkeypatch.setattr(book_badminton, "search_badminton", no_op)
+    monkeypatch.setattr(book_badminton, "open_available_spaces", no_op)
+    monkeypatch.setattr(
+        book_badminton,
+        "book_best_available_slot",
+        fail_primaries_then_confirm_fallback,
+    )
+
+    async def scenario():
+        return await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    book_badminton.run_account_booking(
+                        browser,
+                        config,
+                        account,
+                        logger,
+                        coordinator,
+                    )
+                    for account in accounts
+                )
+            ),
+            timeout=1,
+        )
+
+    assert asyncio.run(scenario()) == [0, 0, 0]
+    selected_times = sorted(slot.start_time for slot in selected_slots.values())
+    assert selected_times == ["15:00", "16:00", "16:00"]
+    assert len(set(selected_slots.values())) == 3
+    assert all("20:00" not in calls for calls in phase_calls.values())
 
 
 def test_full_page_diagnostics_run_once_only_after_all_phases_exhaust(monkeypatch):
@@ -2269,7 +2420,8 @@ def test_full_page_diagnostics_run_once_only_after_all_phases_exhaust(monkeypatc
     )
 
     assert exit_code == 0
-    assert phase_calls == ["17:00", "19:00", "20:00"]
+    assert phase_calls == ["17:00", "16:00", "15:00", "19:00"]
+    assert "20:00" not in phase_calls
     assert diagnostic_calls == [True]
     assert len(browser.contexts) == 1
 

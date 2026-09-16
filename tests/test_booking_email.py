@@ -7,6 +7,7 @@ from booking_email import (
     apply_manual_bookings_to_run_results,
     build_email_message,
     build_report,
+    collect_attempted_booking_dates,
     collect_confirmed_bookings,
     format_booking_result,
     load_email_settings,
@@ -120,6 +121,32 @@ def test_collect_confirmed_bookings_keeps_only_latest_slot_per_account_and_date(
     }
 
 
+def test_collect_attempted_booking_dates_keeps_no_slot_runs_and_skips_dry_runs(
+    tmp_path,
+):
+    write_log(
+        tmp_path / "book-badminton-20260908-235932.log",
+        [
+            "2026-09-08 23:59:32 | INFO | [账号A] HEADLESS=True DRY_RUN=False TIMEZONE=Europe/London",
+            "2026-09-08 23:59:32 | INFO | [账号A] Target booking date is 17/09/2026",
+            "2026-09-09 00:00:05 | INFO | [账号A] No preferred slots were available to book.",
+        ],
+    )
+    write_log(
+        tmp_path / "book-badminton-20260909-120000.log",
+        [
+            "2026-09-09 12:00:00 | INFO | [账号A] HEADLESS=True DRY_RUN=True TIMEZONE=Europe/London",
+            "2026-09-09 12:00:00 | INFO | [账号A] Target booking date is 18/09/2026",
+        ],
+    )
+    write_log(
+        tmp_path / "book-badminton-broken.log",
+        ["not a booking log"],
+    )
+
+    assert collect_attempted_booking_dates(tmp_path) == (date(2026, 9, 17),)
+
+
 def test_manual_bookings_override_log_history_and_current_run(tmp_path):
     log_path = tmp_path / "book-badminton-20260820-235931.log"
     write_log(
@@ -189,9 +216,9 @@ def test_parse_run_log_supports_legacy_single_account_logs(tmp_path):
 def test_build_report_colours_complete_pair_green_and_other_days_yellow():
     report_date = date(2026, 7, 20)
     bookings = (
-        ConfirmedBooking(report_date, "账号A", "19:00", 4),
-        ConfirmedBooking(report_date, "账号B", "20:00", 4),
-        ConfirmedBooking(report_date.replace(day=21), "账号A", "18:00", 3),
+        ConfirmedBooking(report_date, "账号A", "17:00", 4),
+        ConfirmedBooking(report_date, "账号B", "18:00", 4),
+        ConfirmedBooking(report_date.replace(day=21), "账号A", "15:00", 3),
     )
     run_results = (
         AccountRunResult("账号A", report_date, bookings[0], "confirmed"),
@@ -207,7 +234,7 @@ def test_build_report_colours_complete_pair_green_and_other_days_yellow():
     assert subject == "[Badminton Booking Report] Mon 20 Jul - Tue 21 Jul"
     assert (
         "The slot booking result for Monday, 20 July is:\n"
-        "19:00 and 20:00 at Court 4."
+        "17:00 and 18:00 at Court 4."
     ) in plain_body
     assert "Account A" not in plain_body
     assert "Account B" not in html_body
@@ -220,7 +247,7 @@ def test_build_report_colours_complete_pair_green_and_other_days_yellow():
     assert (
         "The slot booking result for Monday, 20 July is:<br>"
         '<span style="background:#e2f0d9;padding:3px 6px">'
-        "19:00 and 20:00 at Court 4</span>."
+        "17:00 and 18:00 at Court 4</span>."
     ) in html_body
     assert '<p style="font-size:20px;line-height:1.6">' in html_body
     assert '<tr style="background:#e2f0d9">' not in html_body
@@ -257,14 +284,35 @@ def test_build_report_marks_any_consecutive_booked_cells_green_only():
     assert '<tr style="background:#fff2cc">' not in html_body
 
 
-def test_build_report_table_runs_from_16_to_20():
+def test_build_report_table_runs_from_15_to_19_only():
     report_date = date(2026, 7, 20)
 
-    _, _, html_body = build_report((), (), report_date)
+    _, plain_body, html_body = build_report((), (), report_date)
 
-    for start_time in ("16:00", "17:00", "18:00", "19:00", "20:00"):
+    for start_time in ("15:00", "16:00", "17:00", "18:00", "19:00"):
         assert f">{start_time}</th>" in html_body
+        assert f"{start_time}: —" in plain_body
+    assert ">14:00</th>" not in html_body
+    assert "14:00:" not in plain_body
+    assert ">20:00</th>" not in html_body
+    assert "20:00:" not in plain_body
     assert ">21:00</th>" not in html_body
+
+
+def test_build_report_omits_historical_slots_outside_target_hours_from_table():
+    report_date = date(2026, 7, 20)
+    bookings = (
+        ConfirmedBooking(report_date, "账号A", "15:00", 1),
+        ConfirmedBooking(report_date, "账号B", "20:00", 2),
+    )
+
+    _, plain_body, html_body = build_report((), bookings, report_date)
+
+    assert "15:00: Court 1" in plain_body
+    assert ">Court 1</td>" in html_body
+    assert "20:00:" not in plain_body
+    assert ">20:00</th>" not in html_body
+    assert "Court 2" not in html_body
 
 
 def test_build_report_merges_multiple_courts_in_the_same_time_cell():
@@ -443,6 +491,60 @@ def test_build_report_runs_through_latest_confirmed_booking_date():
 
     assert "Mon 20 Jul" in plain_body
     assert "Tue 28 Jul" in plain_body
+
+
+def test_build_report_keeps_all_failed_target_date_with_dash_cells():
+    report_date = date(2026, 9, 10)
+    failed_target_date = date(2026, 9, 18)
+    run_results = tuple(
+        AccountRunResult(
+            account_label,
+            failed_target_date,
+            None,
+            "no preferred slot was available",
+        )
+        for account_label in ("账号A", "账号B", "账号C")
+    )
+
+    subject, plain_body, html_body = build_report(
+        run_results,
+        (),
+        report_date,
+        attempted_booking_dates=(failed_target_date,),
+    )
+
+    assert subject == "[Badminton Booking Report] Thu 10 Sep - Fri 18 Sep"
+    assert "Fri 18 Sep: 15:00: —" in plain_body
+    failed_row = html_body.split(">Fri 18 Sep</td>", 1)[1].split("</tr>", 1)[0]
+    assert failed_row.count("</td>") == 5
+    assert "Court" not in failed_row
+    assert failed_row.count(">—</td>") == 5
+
+
+def test_build_report_preserves_historical_failed_date_after_a_later_run():
+    report_date = date(2026, 9, 10)
+    current_target_date = date(2026, 9, 17)
+    historical_failed_date = date(2026, 9, 18)
+    run_results = (
+        AccountRunResult(
+            "账号A",
+            current_target_date,
+            ConfirmedBooking(current_target_date, "账号A", "18:00", 1),
+            "confirmed",
+        ),
+    )
+
+    subject, plain_body, html_body = build_report(
+        run_results,
+        (run_results[0].booking,),
+        report_date,
+        attempted_booking_dates=(historical_failed_date,),
+    )
+
+    assert subject.endswith("Fri 18 Sep")
+    assert "Thu 17 Sep: 15:00: —" in plain_body
+    assert ">Court 1</td>" in html_body
+    assert ">Fri 18 Sep</td>" in html_body
 
 
 def test_load_email_settings_reads_legacy_constants_without_executing_script(

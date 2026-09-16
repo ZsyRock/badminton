@@ -49,16 +49,23 @@ AUTHENTICATION_FAILURE_PATTERNS = (
 MIDNIGHT_PREWARM_WINDOW_SECONDS = 120
 MAX_ACCOUNT_SESSION_ATTEMPTS = 3
 ACCOUNT_RETRY_DELAY_SECONDS = 2
+COORDINATION_WAIT_TIMEOUT_SECONDS = 5
 ACCOUNT_A_KEY = "account_a"
 ACCOUNT_B_KEY = "account_b"
 ACCOUNT_C_KEY = "account_c"
 ACCOUNT_A_LABEL = "账号A"
 ACCOUNT_B_LABEL = "账号B"
 ACCOUNT_C_LABEL = "账号C"
+TARGET_BOOKING_TIMES = ("15:00", "16:00", "17:00", "18:00", "19:00")
+ACCOUNT_PRIMARY_TIMES = {
+    ACCOUNT_A_KEY: "18:00",
+    ACCOUNT_B_KEY: "18:00",
+    ACCOUNT_C_KEY: "17:00",
+}
+FALLBACK_TIMES = ("19:00", "16:00", "15:00")
 ACCOUNT_ATTEMPT_TIMES = {
-    ACCOUNT_A_KEY: ("18:00", "16:00", "20:00"),
-    ACCOUNT_B_KEY: ("18:00", "16:00", "20:00"),
-    ACCOUNT_C_KEY: ("17:00", "19:00", "20:00"),
+    account_key: (primary_time, *FALLBACK_TIMES)
+    for account_key, primary_time in ACCOUNT_PRIMARY_TIMES.items()
 }
 SUCCESSFUL_BOOKING_OUTCOMES = {"confirmed", "dry-run"}
 BASKET_ITEM_ADDED_TEXT = "added to basket"
@@ -114,6 +121,8 @@ class BookingCoordinator:
         default_factory=dict
     )
     slot_claim_owners: dict[SlotPreference, str] = field(default_factory=dict)
+    active_phase_times: dict[str, str] = field(default_factory=dict)
+    fallback_time_owners: dict[str, set[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -489,8 +498,16 @@ def get_account_attempt_times(account_key: str) -> tuple[str, ...]:
         raise ValueError(f"Unsupported account key: {account_key}") from exc
 
 
+def get_account_primary_time(account_key: str) -> str:
+    try:
+        return ACCOUNT_PRIMARY_TIMES[account_key]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported account key: {account_key}") from exc
+
+
 def get_required_search_window_times(account_key: str) -> tuple[str, ...]:
-    return get_account_attempt_times(account_key)
+    get_account_primary_time(account_key)
+    return TARGET_BOOKING_TIMES
 
 
 def build_search_window_times(
@@ -2136,7 +2153,18 @@ async def wait_for_phase_selection(
         "Waiting for Account A to select a %s court before Account B starts the same time.",
         start_time,
     )
-    await ready_event.wait()
+    try:
+        await asyncio.wait_for(
+            ready_event.wait(),
+            timeout=COORDINATION_WAIT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Account A did not publish a %s selection within %ss; Account B "
+            "will proceed, while exact-slot claims still prevent a collision.",
+            start_time,
+            COORDINATION_WAIT_TIMEOUT_SECONDS,
+        )
     return coordinator.phase_selections.get(
         _phase_selection_key(account_key, start_time)
     )
@@ -2173,8 +2201,193 @@ def release_slot_for_account(
     return True
 
 
+def _clock_hour(start_time: str) -> int:
+    return int(start_time.split(":", 1)[0])
+
+
+def _longest_consecutive_run(start_times: Iterable[str]) -> int:
+    hours = sorted({_clock_hour(start_time) for start_time in start_times})
+    if not hours:
+        return 0
+    longest = current = 1
+    for previous, current_hour in zip(hours, hours[1:]):
+        if current_hour == previous + 1:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 1
+    return longest
+
+
+def _fallback_time_score(
+    start_time: str,
+    occupied_time_counts: dict[str, int],
+) -> tuple[int, int, int, int, int, int]:
+    """Rank a fallback by continuity first and the requested edge order last."""
+
+    expanded_counts = dict(occupied_time_counts)
+    expanded_counts[start_time] = expanded_counts.get(start_time, 0) + 1
+    expanded = set(expanded_counts)
+    hours = {_clock_hour(value) for value in expanded}
+    adjacent_edges = sum(hour + 1 in hours for hour in hours)
+    available_pairs = [
+        (first, second, priority)
+        for (first, second), priority in {
+            (17, 18): 4,
+            (18, 19): 3,
+            (16, 17): 2,
+            (15, 16): 1,
+        }.items()
+        if first in hours and second in hours
+    ]
+    pair_priority = max(
+        (priority for _, _, priority in available_pairs),
+        default=0,
+    )
+    duplicate_in_pair = int(
+        any(
+            expanded_counts.get(f"{first:02d}:00", 0) >= 2
+            or expanded_counts.get(f"{second:02d}:00", 0) >= 2
+            for first, second, _ in available_pairs
+        )
+    )
+    requested_tie_break = {
+        "19:00": 3,
+        "16:00": 2,
+        "15:00": 1,
+    }[start_time]
+    return (
+        int(bool(available_pairs)),
+        pair_priority,
+        duplicate_in_pair,
+        _longest_consecutive_run(expanded),
+        adjacent_edges,
+        requested_tie_break,
+    )
+
+
+def get_coordinated_time_counts(
+    coordinator: BookingCoordinator,
+) -> dict[str, int]:
+    """Count confirmed/provisional account assignments for each booking hour."""
+
+    account_time_pairs = {
+        (owner, slot.start_time)
+        for slot, owner in coordinator.slot_claim_owners.items()
+    }
+    account_time_pairs.update(coordinator.active_phase_times.items())
+    account_time_pairs.update(
+        (owner, start_time)
+        for start_time, owners in coordinator.fallback_time_owners.items()
+        for owner in owners
+    )
+    counts: dict[str, int] = {}
+    for _, start_time in account_time_pairs:
+        counts[start_time] = counts.get(start_time, 0) + 1
+    return counts
+
+
+def reserve_next_fallback_time(
+    coordinator: BookingCoordinator,
+    account_key: str,
+    completed_times: set[str],
+) -> str | None:
+    """Atomically reserve the best remaining fallback hour for one account."""
+
+    for start_time, owners in coordinator.fallback_time_owners.items():
+        if account_key in owners and start_time not in completed_times:
+            return start_time
+
+    occupied_time_counts = get_coordinated_time_counts(coordinator)
+    candidates = [
+        start_time
+        for start_time in FALLBACK_TIMES
+        if start_time not in completed_times
+        and occupied_time_counts.get(start_time, 0) < 2
+    ]
+    if not candidates:
+        return None
+
+    if occupied_time_counts:
+        candidates.sort(
+            key=lambda value: _fallback_time_score(value, occupied_time_counts),
+            reverse=True,
+        )
+    else:
+        # With no surviving 17:00/18:00 anchor, 16:00 gives the other
+        # unbooked accounts the best chance to create a 15:00-17:00 pair.
+        empty_plan_priority = {"16:00": 3, "15:00": 2, "19:00": 1}
+        candidates.sort(
+            key=lambda value: empty_plan_priority[value],
+            reverse=True,
+        )
+
+    selected_time = candidates[0]
+    coordinator.fallback_time_owners.setdefault(selected_time, set()).add(account_key)
+    return selected_time
+
+
+def release_fallback_time_for_account(
+    coordinator: BookingCoordinator,
+    account_key: str,
+    start_time: str,
+) -> bool:
+    owners = coordinator.fallback_time_owners.get(start_time)
+    if owners is None or account_key not in owners:
+        return False
+    owners.remove(account_key)
+    if not owners:
+        del coordinator.fallback_time_owners[start_time]
+    return True
+
+
+def release_all_fallback_times_for_account(
+    coordinator: BookingCoordinator,
+    account_key: str,
+) -> None:
+    """Remove logical reservations after an account reaches a terminal outcome."""
+
+    for start_time in tuple(coordinator.fallback_time_owners):
+        release_fallback_time_for_account(coordinator, account_key, start_time)
+
+
 def _account_is_configured(config: AppConfig, account_key: str) -> bool:
     return any(account.key == account_key for account in config.accounts)
+
+
+async def wait_for_primary_phase_decisions(
+    config: AppConfig,
+    coordinator: BookingCoordinator,
+    logger: logging.Logger,
+) -> None:
+    """Wait for fast primary selections/exhaustion, never full confirmations."""
+
+    events = [
+        get_phase_selection_event(
+            coordinator,
+            configured_account.key,
+            get_account_primary_time(configured_account.key),
+        )
+        for configured_account in config.accounts
+    ]
+    pending_count = sum(not event.is_set() for event in events)
+    if pending_count:
+        logger.info(
+            "Waiting for %s remaining primary selection decision(s) before "
+            "coordinating fallback time.",
+            pending_count,
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(event.wait() for event in events)),
+                timeout=COORDINATION_WAIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Primary coordination timed out after %ss; choosing from the "
+                "currently known provisional assignments.",
+                COORDINATION_WAIT_TIMEOUT_SECONDS,
+            )
 
 
 def build_phase_preferences(
@@ -2260,16 +2473,32 @@ async def run_account_booking_session(
         )
 
         last_result: BookingAttemptResult | None = None
-        for start_time in get_account_attempt_times(account.key):
-            if start_time in progress.completed_times:
+        primary_time = get_account_primary_time(account.key)
+        while True:
+            is_primary_phase = primary_time not in progress.completed_times
+            if is_primary_phase:
+                start_time = primary_time
+            else:
+                await wait_for_primary_phase_decisions(config, coordinator, logger)
+                start_time = reserve_next_fallback_time(
+                    coordinator,
+                    account.key,
+                    progress.completed_times,
+                )
+                if start_time is None:
+                    logger.info("No untried coordinated fallback time remains.")
+                    break
                 logger.info(
-                    "Skipping already completed %s phase after session recovery.",
+                    "Coordinator assigned %s as the next fallback based on the "
+                    "currently selected hours.",
                     start_time,
                 )
-                continue
+
+            coordinator.active_phase_times[account.key] = start_time
 
             if (
-                account.key == ACCOUNT_B_KEY
+                is_primary_phase
+                and account.key == ACCOUNT_B_KEY
                 and _account_is_configured(config, ACCOUNT_A_KEY)
             ):
                 account_a_selection = await wait_for_phase_selection(
@@ -2320,6 +2549,8 @@ async def run_account_booking_session(
                 ),
             )
             progress.completed_times.add(start_time)
+            if coordinator.active_phase_times.get(account.key) == start_time:
+                del coordinator.active_phase_times[account.key]
             if phase_result is not None:
                 if booking_attempt_succeeded(phase_result):
                     if not claim_slot_for_account(
@@ -2333,7 +2564,15 @@ async def run_account_booking_session(
                             "slot claim."
                         )
                 last_result = phase_result
-            else:
+            if is_primary_phase and not booking_attempt_succeeded(phase_result):
+                key = _phase_selection_key(account.key, start_time)
+                coordinator.phase_selections[key] = None
+                get_phase_selection_event(
+                    coordinator,
+                    account.key,
+                    start_time,
+                ).set()
+            elif phase_result is None:
                 publish_phase_selection(
                     coordinator,
                     account.key,
@@ -2342,6 +2581,17 @@ async def run_account_booking_session(
                 )
             if booking_attempt_succeeded(phase_result):
                 break
+            if not is_primary_phase:
+                if release_fallback_time_for_account(
+                    coordinator,
+                    account.key,
+                    start_time,
+                ):
+                    logger.info(
+                        "Released the coordinated fallback-time reservation for %s "
+                        "after the phase was exhausted.",
+                        start_time,
+                    )
 
         if not config.dry_run and not booking_attempt_succeeded(last_result):
             await log_available_spaces_diagnostics_best_effort(
@@ -2399,8 +2649,10 @@ async def run_account_booking(
     )
     logger.info("Target booking date is %s", format_date_for_site(coordinator.target_date))
     logger.info(
-        "Booking time order is %s; court order is %s.",
-        " -> ".join(get_account_attempt_times(account.key)),
+        "Primary booking time is %s; coordinated fallback pool is %s; court "
+        "order is %s.",
+        get_account_primary_time(account.key),
+        " -> ".join(FALLBACK_TIMES),
         " -> ".join(str(court) for court in account.court_priority),
     )
     if coordinator.release_at is not None:
@@ -2484,6 +2736,8 @@ async def run_account_booking(
         logger.error("Booking run failed: no browser session attempt was executed.")
         return 1
     finally:
+        coordinator.active_phase_times.pop(account.key, None)
+        release_all_fallback_times_for_account(coordinator, account.key)
         release_remaining_account_phases(coordinator, account.key)
 
 
