@@ -8,7 +8,7 @@ import os
 import re
 import smtplib
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -553,22 +553,18 @@ def build_report(
     ]
     times = REPORT_TIMES
 
-    target_dates = [result.target_date for result in run_results if result.target_date]
-    target_date = target_dates[0] if target_dates else None
-    if target_date is not None:
-        target_text = f"{target_date:%A}, {target_date.day} {target_date:%B}"
-        if target_date > report_date:
-            target_text = f"next {target_text}"
-    else:
-        target_text = "the requested date"
-    current_bookings = sorted(
-        (result.booking for result in run_results if result.booking is not None),
+    today_bookings = sorted(
+        (
+            booking
+            for booking in confirmed_bookings
+            if booking.booking_date == report_date
+        ),
         key=lambda booking: (booking.start_time, booking.court_number),
     )
-    if current_bookings:
-        if _has_multiple_courts_at_same_time(current_bookings):
-            result_groups = _booking_result_groups(current_bookings)
-            html_groups = _format_booking_result_html_groups(current_bookings)
+    if today_bookings:
+        if _has_multiple_courts_at_same_time(today_bookings):
+            result_groups = _booking_result_groups(today_bookings)
+            html_groups = _format_booking_result_html_groups(today_bookings)
             result_detail_lines = [
                 f"{phrase}{',' if index < len(result_groups) - 1 else '.'}"
                 for index, (phrase, _) in enumerate(result_groups)
@@ -578,16 +574,16 @@ def build_report(
                 for index, phrase in enumerate(html_groups)
             )
         else:
-            booking_text = format_booking_result(current_bookings)
+            booking_text = format_booking_result(today_bookings)
             result_detail_lines = [f"{booking_text}."]
-            result_detail_html = f"{format_booking_result_html(current_bookings)}."
+            result_detail_html = f"{format_booking_result_html(today_bookings)}."
     else:
-        result_detail_lines = ["No slot was successfully booked."]
+        result_detail_lines = ["No slots are booked for today."]
         result_detail_html = (
             '<span style="background:#fff2cc;padding:3px 6px">'
-            "No slot was successfully booked.</span>"
+            "No slots are booked for today.</span>"
         )
-    result_prefix = f"The slot booking result for {target_text} is:"
+    result_prefix = "Today's playable slots are:"
 
     plain_lines = [
         result_prefix,
@@ -668,8 +664,28 @@ def send_booking_report(
     logs_dir: Path,
     timezone_name: str,
     logger: logging.Logger,
+    recipients_override: Iterable[str] | None = None,
 ) -> None:
     settings = load_email_settings()
+    if recipients_override is not None:
+        if isinstance(recipients_override, str):
+            raw_recipients = (recipients_override,)
+        else:
+            raw_recipients = tuple(recipients_override)
+        override_recipients: list[str] = []
+        seen_recipients: set[str] = set()
+        for raw_recipient in raw_recipients:
+            recipient = raw_recipient.strip()
+            normalized_recipient = recipient.casefold()
+            if not recipient or normalized_recipient in seen_recipients:
+                continue
+            if "\r" in recipient or "\n" in recipient or "@" not in recipient:
+                raise ValueError(f"Invalid booking-report recipient: {recipient!r}")
+            override_recipients.append(recipient)
+            seen_recipients.add(normalized_recipient)
+        if not override_recipients:
+            raise ValueError("Booking-report recipient override cannot be empty")
+        settings = replace(settings, recipients=tuple(override_recipients))
     manual_bookings_path = logs_dir.parent / MANUAL_BOOKINGS_FILENAME
     manual_bookings = load_manual_bookings(manual_bookings_path)
     run_results = apply_manual_bookings_to_run_results(
@@ -705,7 +721,12 @@ def send_booking_report(
         context=context,
     ) as server:
         server.login(settings.sender, settings.password)
-        server.send_message(message)
+        refused_recipients = server.send_message(message)
+        if refused_recipients:
+            refused = ", ".join(sorted(refused_recipients))
+            raise RuntimeError(
+                f"SMTP refused booking-report recipients: {refused}"
+            )
     logger.info(
         "Booking report email sent successfully to %s",
         ", ".join(settings.recipients),

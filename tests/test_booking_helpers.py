@@ -118,7 +118,10 @@ class AvailableSpacesTestPage:
 class StatefulBasketPage:
     def __init__(self):
         self.state = "slot"
-        self.url = "https://example.test/book/calendar"
+        self.url = (
+            "https://example.test/book/calendar/activity?"
+            "activityDate=2026-08-11T00%3A00%3A00.000Z"
+        )
         self.pending_route = None
         self.go_to_basket = StubLocator(on_click=self._open_basket)
         self.basket_item = StubLocator(
@@ -172,6 +175,84 @@ class StatefulBasketPage:
             raise book_badminton.PlaywrightTimeoutError(
                 f"URL {self.url!r} did not match {pattern.pattern!r}"
             )
+
+
+class OverbookingBasketPage(StatefulBasketPage):
+    def __init__(self, *, stale_marker=False):
+        super().__init__()
+        self.stale_marker = stale_marker
+
+    def _submit_checkout(self):
+        self.state = "overbooked"
+
+    def locator(self, selector):
+        if selector == "body" and self.state == "checkout" and self.stale_marker:
+            return StubLocator(
+                text="Checkout\nACTIVITY-OVER-BOOKING.ERRORS.OVER-BOOKING-ERROR-SHOWN"
+            )
+        if selector == "body" and self.state == "overbooked":
+            return StubLocator(
+                text=(
+                    "Checkout\n"
+                    "ACTIVITY-OVER-BOOKING.ERRORS.OVER-BOOKING-ERROR-SHOWN"
+                )
+            )
+        return super().locator(selector)
+
+
+class RemovableBasketItemLocator(StubLocator):
+    def __init__(self, page, *, text):
+        super().__init__(text=text)
+        self.page = page
+
+    async def wait_for(self, *, state="visible", **_kwargs):
+        if state == "visible" and not self.page.item_present:
+            raise book_badminton.PlaywrightTimeoutError("basket item missing")
+        if state == "detached" and self.page.item_present:
+            raise book_badminton.PlaywrightTimeoutError("basket item remained")
+
+    async def count(self):
+        return 1 if self.page.item_present else 0
+
+    def locator(self, selector):
+        if selector == "button[id^='remove-basket-item-btn']":
+            return self.page.remove_button
+        return StubLocator(count=0, visible=False)
+
+
+class BasketCleanupPage:
+    def __init__(self, *, item_text=None, remove_succeeds=True):
+        self.url = "https://example.test/book/checkout"
+        self.goto_calls = []
+        self.item_present = True
+        self.remove_succeeds = remove_succeeds
+        self.remove_button = StubLocator(on_click=self._remove_item)
+        self.basket_item = RemovableBasketItemLocator(
+            self,
+            text=item_text
+            or (
+                "Badminton\nTue, 11 August, 2026\nJubilee Court 1\n"
+                "19:00 - 20:00\n£0.00"
+            ),
+        )
+
+    def _remove_item(self):
+        if self.remove_succeeds:
+            self.item_present = False
+
+    def locator(self, selector):
+        if selector == ".basket-item":
+            return self.basket_item
+        if selector == "body":
+            return StubLocator(text="Jubilee Court 1\n19:00 - 20:00\nBook now")
+        return StubLocator(count=0, visible=False)
+
+    async def goto(self, url, **_kwargs):
+        self.goto_calls.append(url)
+        self.url = url
+
+    async def wait_for_load_state(self, *_args, **_kwargs):
+        return None
 
 
 def make_test_booking_context():
@@ -915,6 +996,19 @@ def test_lease_creation_error_count_is_normalized_and_exact():
     ) == 0
 
 
+def test_overbooking_error_count_is_normalized_and_exact():
+    body_text = """
+    ACTIVITY-OVER-BOOKING.ERRORS.OVER-BOOKING-ERROR-SHOWN
+    activity-over-booking.errors.over-booking-error-shown
+    ACTIVITY-OVER-BOOKING.ERRORS.UNRELATED
+    """
+
+    assert book_badminton.overbooking_error_count(body_text) == 2
+    assert book_badminton.overbooking_error_count(
+        "ACTIVITY-OVER-BOOKING.ERRORS.OVER-BOOKING-ERROR"
+    ) == 0
+
+
 def test_basket_contains_expected_slot_requires_activity_date_court_and_time():
     slot = SlotPreference("19:00", 1)
     target_date = date(2026, 8, 11)
@@ -990,7 +1084,7 @@ def test_recover_pending_basket_booking_completes_zero_price_checkout(monkeypatc
         )
     )
 
-    assert recovered is True
+    assert recovered == "confirmed"
     assert page.go_to_basket.click_count == 1
     assert page.continue_to_payment.click_count == 1
     assert page.submit_no_price.click_count == 1
@@ -1038,6 +1132,223 @@ def test_recover_pending_basket_booking_rejects_mismatched_item(monkeypatch):
         raise AssertionError("Expected mismatched basket item to stop recovery")
 
     asyncio.run(scenario())
+
+
+def test_recover_pending_basket_booking_continues_only_for_new_overbooking_marker(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    slot = SlotPreference("19:00", 1)
+    page = OverbookingBasketPage()
+    cleanup_calls = []
+    observed_baselines = []
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def no_confirmation(*_args, **kwargs):
+        observed_baselines.append(kwargs.get("overbooking_error_baseline"))
+        return False
+
+    async def record_cleanup(*args, **_kwargs):
+        cleanup_calls.append((args[1], args[2], args[3]))
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_booking_confirmation_page",
+        no_confirmation,
+    )
+    monkeypatch.setattr(
+        book_badminton,
+        "discard_overbooked_basket_item_and_restore_calendar",
+        record_cleanup,
+    )
+
+    outcome = asyncio.run(
+        book_badminton.recover_pending_basket_booking(
+            page,
+            slot,
+            date(2026, 8, 11),
+            config,
+            account,
+            logger,
+        )
+    )
+
+    assert outcome == "overbooking-rejected"
+    assert observed_baselines == [0]
+    assert cleanup_calls == [
+        (
+            slot,
+            date(2026, 8, 11),
+            (
+                "https://example.test/book/calendar/activity?"
+                "activityDate=2026-08-11T00%3A00%3A00.000Z"
+            ),
+        )
+    ]
+
+
+def test_recover_pending_basket_booking_stops_for_stale_overbooking_marker(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    page = OverbookingBasketPage(stale_marker=True)
+    cleanup_calls = []
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def no_confirmation(*_args, **_kwargs):
+        return False
+
+    async def unexpected_cleanup(*_args, **_kwargs):
+        cleanup_calls.append(True)
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_booking_confirmation_page",
+        no_confirmation,
+    )
+    monkeypatch.setattr(
+        book_badminton,
+        "discard_overbooked_basket_item_and_restore_calendar",
+        unexpected_cleanup,
+    )
+
+    with pytest.raises(book_badminton.BasketRecoveryError):
+        asyncio.run(
+            book_badminton.recover_pending_basket_booking(
+                page,
+                SlotPreference("19:00", 1),
+                date(2026, 8, 11),
+                config,
+                account,
+                logger,
+            )
+        )
+
+    assert cleanup_calls == []
+
+
+def test_recover_pending_basket_booking_still_stops_for_unknown_checkout_state(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    page = StatefulBasketPage()
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def no_confirmation(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_booking_confirmation_page",
+        no_confirmation,
+    )
+
+    with pytest.raises(book_badminton.BasketRecoveryError):
+        asyncio.run(
+            book_badminton.recover_pending_basket_booking(
+                page,
+                SlotPreference("19:00", 1),
+                date(2026, 8, 11),
+                config,
+                account,
+                logger,
+            )
+        )
+
+
+def test_overbooking_cleanup_removes_only_expected_item_and_restores_calendar(
+    monkeypatch,
+):
+    config, _account, logger = make_test_booking_context()
+    page = BasketCleanupPage()
+    calendar_url = (
+        "https://example.test/book/calendar/activity?"
+        "activityDate=2026-08-11T00%3A00%3A00.000Z"
+    )
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_op)
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_available_spaces_content",
+        no_op,
+    )
+
+    asyncio.run(
+        book_badminton.discard_overbooked_basket_item_and_restore_calendar(
+            page,
+            SlotPreference("19:00", 1),
+            date(2026, 8, 11),
+            calendar_url,
+            config,
+            logger,
+        )
+    )
+
+    assert not page.item_present
+    assert page.remove_button.click_count == 1
+    assert page.goto_calls == [
+        "https://example.test/book/basket",
+        calendar_url,
+    ]
+    assert page.url == calendar_url
+
+
+@pytest.mark.parametrize(
+    ("item_text", "remove_succeeds"),
+    [
+        (
+            "Badminton\nTue, 11 August, 2026\nJubilee Court 4\n"
+            "19:00 - 20:00\n£0.00",
+            True,
+        ),
+        (None, False),
+    ],
+)
+def test_overbooking_cleanup_stops_if_item_cannot_be_safely_removed(
+    monkeypatch,
+    item_text,
+    remove_succeeds,
+):
+    config, _account, logger = make_test_booking_context()
+    page = BasketCleanupPage(
+        item_text=item_text,
+        remove_succeeds=remove_succeeds,
+    )
+    calendar_url = (
+        "https://example.test/book/calendar/activity?"
+        "activityDate=2026-08-11T00%3A00%3A00.000Z"
+    )
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_op)
+
+    with pytest.raises(book_badminton.BasketRecoveryError):
+        asyncio.run(
+            book_badminton.discard_overbooked_basket_item_and_restore_calendar(
+                page,
+                SlotPreference("19:00", 1),
+                date(2026, 8, 11),
+                calendar_url,
+                config,
+                logger,
+            )
+        )
+
+    assert page.goto_calls == ["https://example.test/book/basket"]
 
 
 def test_try_book_slot_recovers_when_final_button_is_missing_because_item_is_in_basket(
@@ -1244,6 +1555,72 @@ def test_book_best_available_slot_releases_rejected_claim_and_tries_next_court(
     assert attempted_slots == [("19:00", 1), ("19:00", 2)]
     assert released_slots == [SlotPreference("19:00", 1)]
     assert refresh_calls == [True]
+
+
+def test_book_best_available_slot_continues_after_cleaned_overbooking_rejection(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    attempted_slots = []
+    released_slots = []
+    refresh_calls = []
+
+    async def visible_slots(*_args, **_kwargs):
+        return [
+            "19:00 Jubilee Court 1",
+            "19:00 Jubilee Court 2",
+        ]
+
+    async def reject_then_confirm(
+        _page,
+        start_time,
+        court_number,
+        *_args,
+        **_kwargs,
+    ):
+        attempted_slots.append((start_time, court_number))
+        if court_number == 1:
+            return "overbooking-rejected"
+        return "confirmed"
+
+    async def unexpected_refresh(*_args, **_kwargs):
+        refresh_calls.append(True)
+
+    def release_slot(slot):
+        released_slots.append(slot)
+        return True
+
+    monkeypatch.setattr(book_badminton, "list_visible_bookable_slots", visible_slots)
+    monkeypatch.setattr(book_badminton, "try_book_slot", reject_then_confirm)
+    monkeypatch.setattr(
+        book_badminton,
+        "refresh_available_spaces_after_rejection",
+        unexpected_refresh,
+    )
+
+    result = asyncio.run(
+        book_badminton.book_best_available_slot(
+            StubPage(),
+            config,
+            account,
+            logger,
+            target_date=date(2026, 8, 11),
+            preferences=(
+                SlotPreference("19:00", 1),
+                SlotPreference("19:00", 2),
+            ),
+            phase_name="19:00",
+            release_slot=release_slot,
+        )
+    )
+
+    assert result == BookingAttemptResult(
+        slot=SlotPreference("19:00", 2),
+        outcome="confirmed",
+    )
+    assert attempted_slots == [("19:00", 1), ("19:00", 2)]
+    assert released_slots == [SlotPreference("19:00", 1)]
+    assert refresh_calls == []
 
 
 def test_book_best_available_slot_preserves_claim_and_stops_for_unknown_state(
@@ -1458,6 +1835,99 @@ def test_confirmation_wait_stops_early_for_new_lease_creation_error(monkeypatch)
     assert not detected
     assert diagnostic_calls == [True]
     assert screenshot_calls == [True]
+
+
+def test_confirmation_wait_stops_early_for_new_overbooking_error(monkeypatch):
+    config, account, logger = make_test_booking_context()
+    page = StubPage(
+        locators={
+            "body": StubLocator(
+                text="ACTIVITY-OVER-BOOKING.ERRORS.OVER-BOOKING-ERROR-SHOWN"
+            )
+        },
+        url="https://example.test/book/checkout",
+    )
+    diagnostic_calls = []
+    screenshot_calls = []
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def record_diagnostics(*_args, **_kwargs):
+        diagnostic_calls.append(True)
+        return False
+
+    async def record_screenshot(*_args, **_kwargs):
+        screenshot_calls.append(True)
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "log_post_confirmation_state",
+        record_diagnostics,
+    )
+    monkeypatch.setattr(book_badminton, "save_named_screenshot", record_screenshot)
+
+    detected = asyncio.run(
+        book_badminton.wait_for_booking_confirmation_page(
+            page,
+            SlotPreference("19:00", 1),
+            config,
+            account,
+            logger,
+            overbooking_error_baseline=0,
+        )
+    )
+
+    assert not detected
+    assert diagnostic_calls == [True]
+    assert screenshot_calls == [True]
+
+
+def test_confirmation_wins_when_success_page_contains_overbooking_marker(
+    monkeypatch,
+):
+    config, account, logger = make_test_booking_context()
+    page = StubPage(
+        locators={
+            "body": StubLocator(
+                text=(
+                    "Booking Confirmed!\nBooking ref: 123456\n"
+                    "ACTIVITY-OVER-BOOKING.ERRORS.OVER-BOOKING-ERROR-SHOWN"
+                )
+            )
+        },
+        url="https://example.test/book/success?salesInvoiceIds=123456",
+    )
+    diagnostic_calls = []
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def record_diagnostics(*_args, **_kwargs):
+        diagnostic_calls.append(True)
+        return True
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "log_post_confirmation_state",
+        record_diagnostics,
+    )
+
+    detected = asyncio.run(
+        book_badminton.wait_for_booking_confirmation_page(
+            page,
+            SlotPreference("19:00", 1),
+            config,
+            account,
+            logger,
+            overbooking_error_baseline=0,
+        )
+    )
+
+    assert detected
+    assert diagnostic_calls == [True]
 
 
 def test_confirmation_wins_when_success_page_contains_stale_lease_error(monkeypatch):

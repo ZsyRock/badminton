@@ -119,11 +119,15 @@ Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_S
 - `TERTIARY_GYM_USERNAME` / `TERTIARY_GYM_PASSWORD`: credentials for `账号C`
 - `TERTIARY_PREFERRED_TIMES`: comma-separated search window times for `账号C`
 - `TERTIARY_PREFERRED_COURTS`: comma-separated court priority for `账号C`
-- `BOOKING_EMAIL_ENABLED=true`: send an HTML report after a real (non-dry-run) booking run
+- `BOOKING_EMAIL_ENABLED=true`: enable the HTML booking report sent by the separate daily 10:00 London-time job
 - `BOOKING_EMAIL_REFERENCE_SCRIPT`: optional path to the existing IP email script; its sender, Gmail app password, and recipient are read without executing the script
 - `BOOKING_EMAIL_FROM`, `BOOKING_EMAIL_APP_PASSWORD`, `BOOKING_EMAIL_APP_PASSWORD_FILE`, `BOOKING_EMAIL_TO`: optional explicit SMTP settings that take precedence over the reference script; the password-file option keeps the secret outside `.env`, and multiple recipients are comma-separated
+- `BOOKING_EMAIL_TEST_TO`: exactly one private recipient for manual report tests; test mode fails closed if this is empty or contains multiple addresses and never falls back to `BOOKING_EMAIL_TO`
+- `BOOKING_CANCELLATION_REMINDER_ENABLED=true`: enable calendar invitations during the final one-hour free-cancellation window
 
-The daily email contains a one-sentence English summary of the current run and a
+The daily email is sent at `10:00 Europe/London`, not at the end of the midnight
+booking run. Its opening section lists the slots that can be played on the report
+date, while its table shows the
 schedule from the current date through the latest attempted or confirmed booking
 date reconstructed from `logs/`. Its table covers 15:00 through 19:00 only; consecutive
 booked cells are light green and isolated booked cells are light yellow. A target
@@ -138,6 +142,19 @@ published with the source code.
 
 Each booked slot is displayed as plain `Court N` text. The report does not add a
 calendar link, hidden event metadata, or calendar attachment to booked cells.
+
+`booking_cancellation_reminder.py` scans confirmed bookings once per minute. At
+five hours before a booked slot, it sends each recipient a private RFC 5545 meeting
+invitation titled `Badminton Cancellation DDL (1h left)`. The transparent event
+runs until four hours before the slot, so it represents the final one-hour
+cancellation window without marking the recipient as busy. Each booking is sent
+only to the email address used by that booking account (`GYM_USERNAME`,
+`SECONDARY_GYM_USERNAME`, or `TERTIARY_GYM_USERNAME`). Even when two accounts book
+different Courts at the same hour, each receives a separate invitation containing
+only its own Court. The daily report recipient list is never used for cancellation
+reminders. A local state file prevents duplicates. If the computer was offline at
+the five-hour point, the script catches up only while the four-hour deadline has
+not passed.
 
 The same rules apply to every target weekday. In the primary wave C targets
 `17:00`, while A gets first choice at `18:00` and B targets a different `18:00`
@@ -201,7 +218,7 @@ HEADLESS=true DRY_RUN=false python book_badminton.py
 ```bash
 source .venv/bin/activate
 python -m pytest -q
-python -m py_compile book_badminton.py
+python -m py_compile book_badminton.py booking_daily_report.py booking_cancellation_reminder.py
 ```
 
 ## Ubuntu Scheduling
@@ -217,10 +234,20 @@ Add:
 ```cron
 CRON_TZ=Europe/London
 59 23 * * * /usr/bin/flock -n /tmp/badminton-booking.lock /bin/bash -lc 'sleep 30; cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/book_badminton.py >> /home/<YOUR_USERNAME>/badminton/logs/cron-run.log 2>&1'
+0 10 * * * /usr/bin/flock -n /tmp/badminton-booking-report.lock /bin/bash -lc 'cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/booking_daily_report.py >> /home/<YOUR_USERNAME>/badminton/logs/booking-report.log 2>&1'
+* * * * * /usr/bin/flock -n /tmp/badminton-cancellation-reminder.lock /bin/bash -lc 'cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/booking_cancellation_reminder.py >> /home/<YOUR_USERNAME>/badminton/logs/cancellation-reminder.log 2>&1'
 ```
 
 This starts every day at `23:59:30` London time, prewarms the three account sessions,
-submits the searches at midnight, and prevents overlapping runs.
+and submits the searches at midnight. The separate report job sends the summary at
+`10:00` London time. Each job has its own lock to prevent overlapping runs.
+
+To send a manual report test only to the single address in
+`BOOKING_EMAIL_TEST_TO`, run:
+
+```bash
+.venv/bin/python booking_daily_report.py --test
+```
 
 Check it:
 
@@ -277,9 +304,13 @@ This repo does not depend on any specific AI tool. A local assistant such as Cla
 ## Files
 
 - [book_badminton.py](book_badminton.py): main script
+- [booking_daily_report.py](booking_daily_report.py): 10:00 daily report sender and isolated test-email entry point
+- [booking_cancellation_reminder.py](booking_cancellation_reminder.py): five-hour cancellation reminder sender
 - [.env.example](.env.example): environment template
 - [requirements.txt](requirements.txt): Python dependencies
 - [tests/test_booking_helpers.py](tests/test_booking_helpers.py): unit tests
+- [tests/test_booking_daily_report.py](tests/test_booking_daily_report.py): report scheduling and test-recipient isolation tests
+- [tests/test_booking_cancellation_reminder.py](tests/test_booking_cancellation_reminder.py): reminder timing and calendar-invite tests
 - [deploy/badminton-booking.service](deploy/badminton-booking.service): optional `systemd` service template
 - [deploy/badminton-booking.timer](deploy/badminton-booking.timer): optional `systemd` timer template
 

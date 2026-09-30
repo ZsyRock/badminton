@@ -18,9 +18,6 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from booking_email import email_notifications_enabled, send_booking_report
-
-
 DEFAULT_BOOKING_URL = "https://soton.gladstonego.cloud/account"
 DEFAULT_LOGIN_PATH = "/auth/login"
 DEFAULT_TIMEZONE = "Europe/London"
@@ -71,6 +68,9 @@ SUCCESSFUL_BOOKING_OUTCOMES = {"confirmed", "dry-run"}
 BASKET_ITEM_ADDED_TEXT = "added to basket"
 BASKET_SLOT_CONFLICT_TEXT = "you already have a booking for this slot in your basket"
 LEASE_CREATION_ERROR_TEXT = "activity-calendar.errors.create-lease"
+OVERBOOKING_ERROR_TEXT = (
+    "activity-over-booking.errors.over-booking-error-shown"
+)
 
 
 @dataclass(frozen=True)
@@ -552,6 +552,12 @@ def lease_creation_error_count(body_text: str) -> int:
     """Count the site's explicit temporary-reservation failure marker."""
 
     return " ".join(body_text.split()).lower().count(LEASE_CREATION_ERROR_TEXT)
+
+
+def overbooking_error_count(body_text: str) -> int:
+    """Count the site's explicit final overbooking-rejection marker."""
+
+    return " ".join(body_text.split()).lower().count(OVERBOOKING_ERROR_TEXT)
 
 
 def basket_contains_expected_slot(
@@ -1484,6 +1490,7 @@ async def wait_for_booking_confirmation_page(
     logger: logging.Logger,
     timeout_ms: int = 20_000,
     lease_error_baseline: int | None = None,
+    overbooking_error_baseline: int | None = None,
 ) -> bool:
     logger.info("Waiting for booking confirmation page for %s", slot.label)
     deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
@@ -1513,6 +1520,25 @@ async def wait_for_booking_confirmation_page(
             await save_named_screenshot(
                 page,
                 f"{account.label}-lease-rejected-{slot.start_time}-court-{slot.court_number}",
+                config.timezone_name,
+                logger,
+            )
+            return False
+
+        if (
+            overbooking_error_baseline is not None
+            and overbooking_error_count(body_text) > overbooking_error_baseline
+        ):
+            logger.warning(
+                "The site explicitly rejected final checkout for %s because the "
+                "space was no longer available; stopping the confirmation wait "
+                "early.",
+                slot.label,
+            )
+            await log_post_confirmation_state(page, slot, logger, body_text=body_text)
+            await save_named_screenshot(
+                page,
+                f"{account.label}-overbooking-rejected-{slot.start_time}-court-{slot.court_number}",
                 config.timezone_name,
                 logger,
             )
@@ -1593,6 +1619,138 @@ async def refresh_available_spaces_after_rejection(
     )
 
 
+async def require_single_expected_zero_price_basket_item(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+) -> Locator:
+    """Return the sole expected basket item, or stop before mutating the basket."""
+
+    basket_items = page.locator(".basket-item")
+    basket_item = basket_items.first
+    await basket_item.wait_for(state="visible", timeout=10_000)
+    basket_item_count = await basket_items.count()
+    if basket_item_count != 1:
+        raise BasketRecoveryError(
+            f"Expected exactly one basket item for {slot.label}, but found "
+            f"{basket_item_count}. Stopping to avoid changing an unrelated item."
+        )
+
+    basket_item_text = await basket_item.inner_text(timeout=5_000)
+    if not basket_contains_expected_slot(basket_item_text, slot, target_date):
+        raise BasketRecoveryError(
+            f"The basket item did not match {slot.label}. Stopping to avoid "
+            "changing an unrelated item."
+        )
+    if "£0.00" not in basket_item_text:
+        raise BasketRecoveryError(
+            f"The basket for {slot.label} was not explicitly shown as £0.00. "
+            "Stopping instead of changing a paid basket item."
+        )
+    return basket_item
+
+
+async def discard_overbooked_basket_item_and_restore_calendar(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+    calendar_url: str,
+    config: AppConfig,
+    logger: logging.Logger,
+) -> None:
+    """Remove one explicitly rejected item, then restore the validated calendar."""
+
+    parsed_calendar_url = urlsplit(calendar_url)
+    if not parsed_calendar_url.scheme or not parsed_calendar_url.netloc:
+        raise BasketRecoveryError(
+            f"Could not safely return to the calendar after {slot.label} was rejected."
+        )
+    try:
+        validate_calendar_target_date(
+            calendar_url,
+            target_date,
+            config.timezone_name,
+        )
+    except TargetDateValidationError as exc:
+        raise BasketRecoveryError(
+            f"The saved calendar URL for {slot.label} did not match the target date."
+        ) from exc
+
+    basket_url = (
+        f"{parsed_calendar_url.scheme}://{parsed_calendar_url.netloc}/book/basket"
+    )
+    logger.warning(
+        "Removing the rejected basket item for %s before trying another slot.",
+        slot.label,
+    )
+    try:
+        await page.goto(basket_url, wait_until="domcontentloaded")
+        await wait_for_network_idle_best_effort(
+            page,
+            logger,
+            "reopening the basket after an explicit overbooking rejection",
+        )
+        await check_for_access_blockers(page, config, logger)
+        if "/book/basket" not in page.url.lower():
+            raise BasketRecoveryError(
+                f"Could not reopen the basket after {slot.label} was rejected."
+            )
+
+        basket_item = await require_single_expected_zero_price_basket_item(
+            page,
+            slot,
+            target_date,
+        )
+        remove_button = basket_item.locator(
+            "button[id^='remove-basket-item-btn']"
+        ).first
+        await remove_button.wait_for(state="visible", timeout=10_000)
+        await remove_button.click(timeout=10_000)
+        try:
+            await basket_item.wait_for(state="detached", timeout=10_000)
+        except PlaywrightTimeoutError:
+            # Count verification below remains the source of truth in case the SPA
+            # hides or reuses the card node instead of detaching it immediately.
+            pass
+        await wait_for_network_idle_best_effort(
+            page,
+            logger,
+            "removing the explicitly rejected basket item",
+        )
+        remaining_basket_items = await page.locator(".basket-item").count()
+        if remaining_basket_items != 0:
+            raise BasketRecoveryError(
+                f"The rejected basket item for {slot.label} did not disappear. "
+                "Stopping before trying another slot."
+            )
+        logger.info("Removed the explicitly rejected basket item for %s.", slot.label)
+
+        await page.goto(calendar_url, wait_until="domcontentloaded")
+        await wait_for_network_idle_best_effort(
+            page,
+            logger,
+            "restoring the available-spaces calendar after basket cleanup",
+        )
+        await check_for_access_blockers(page, config, logger)
+        await wait_for_available_spaces_content(page, config, logger)
+        validate_calendar_target_date(
+            page.url,
+            target_date,
+            config.timezone_name,
+        )
+        logger.info(
+            "Revalidated available-spaces calendar date after basket cleanup: %s",
+            format_date_for_site(target_date),
+        )
+    except (AccessBlockerError, BasketRecoveryError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - basket mutation is a safety boundary
+        raise BasketRecoveryError(
+            f"Could not safely clear the rejected basket item for {slot.label} and "
+            "restore the booking calendar."
+        ) from exc
+
+
 async def recover_pending_basket_booking(
     page: Page,
     slot: SlotPreference,
@@ -1600,9 +1758,10 @@ async def recover_pending_basket_booking(
     config: AppConfig,
     account: BookingAccountConfig,
     logger: logging.Logger,
-) -> bool:
+) -> str:
     """Complete the site's zero-price checkout for exactly one known basket item."""
 
+    calendar_url = page.url
     logger.warning(
         "%s was added to the basket without reaching confirmation; attempting the "
         "site's zero-price basket checkout.",
@@ -1630,32 +1789,18 @@ async def recover_pending_basket_booking(
                 "Booking confirmation appeared while opening the basket for %s.",
                 slot.label,
             )
-            return True
+            return "confirmed"
 
         if "/book/basket" not in page.url.lower():
             raise BasketRecoveryError(
                 f"The basket link for {slot.label} did not open the expected basket page."
             )
 
-        basket_item = page.locator(".basket-item").first
-        await basket_item.wait_for(state="visible", timeout=10_000)
-        basket_item_count = await page.locator(".basket-item").count()
-        if basket_item_count != 1:
-            raise BasketRecoveryError(
-                f"Expected exactly one basket item for {slot.label}, but found "
-                f"{basket_item_count}. Stopping to avoid confirming an unrelated item."
-            )
-        basket_item_text = await basket_item.inner_text(timeout=5_000)
-        if not basket_contains_expected_slot(basket_item_text, slot, target_date):
-            raise BasketRecoveryError(
-                f"The basket item did not match {slot.label}. Stopping to avoid "
-                "confirming an unrelated item."
-            )
-        if "£0.00" not in basket_item_text:
-            raise BasketRecoveryError(
-                f"The basket for {slot.label} was not explicitly shown as £0.00. "
-                "Stopping instead of entering a paid checkout."
-            )
+        await require_single_expected_zero_price_basket_item(
+            page,
+            slot,
+            target_date,
+        )
 
         continue_to_payment = page.locator("#continue-to-payment-btn").first
         await continue_to_payment.wait_for(state="visible", timeout=10_000)
@@ -1678,7 +1823,7 @@ async def recover_pending_basket_booking(
                 "Booking confirmation appeared while opening checkout for %s.",
                 slot.label,
             )
-            return True
+            return "confirmed"
 
         if "/book/checkout" not in page.url.lower():
             raise BasketRecoveryError(
@@ -1688,6 +1833,7 @@ async def recover_pending_basket_booking(
 
         submit_no_price = page.locator("#submit-no-price-btn").first
         await submit_no_price.wait_for(state="visible", timeout=10_000)
+        overbooking_error_baseline = overbooking_error_count(checkout_body)
         await submit_no_price.click(timeout=10_000)
         logger.info("Submitted zero-price basket confirmation for %s.", slot.label)
         await wait_for_network_idle_best_effort(
@@ -1708,9 +1854,38 @@ async def recover_pending_basket_booking(
         config,
         account,
         logger,
+        overbooking_error_baseline=overbooking_error_baseline,
     ):
         logger.info("Recovered and confirmed %s through the basket.", slot.label)
-        return True
+        return "confirmed"
+
+    post_checkout_body = await read_page_body_text(page)
+    if booking_confirmation_detected(page.url, post_checkout_body):
+        logger.info(
+            "Recovered an explicit booking confirmation for %s after the checkout "
+            "wait completed.",
+            slot.label,
+        )
+        return "confirmed"
+
+    if (
+        overbooking_error_count(post_checkout_body)
+        > overbooking_error_baseline
+    ):
+        logger.warning(
+            "Final checkout explicitly rejected %s because the space was no longer "
+            "available.",
+            slot.label,
+        )
+        await discard_overbooked_basket_item_and_restore_calendar(
+            page,
+            slot,
+            target_date,
+            calendar_url,
+            config,
+            logger,
+        )
+        return "overbooking-rejected"
 
     raise BasketRecoveryError(
         f"Basket checkout for {slot.label} was submitted, but no explicit booking "
@@ -1748,7 +1923,7 @@ async def recover_basket_state_if_present(
         return "confirmed"
 
     if basket_item_added_detected(body_text):
-        recovered = await recover_pending_basket_booking(
+        return await recover_pending_basket_booking(
             page,
             slot,
             target_date,
@@ -1756,7 +1931,6 @@ async def recover_basket_state_if_present(
             account,
             logger,
         )
-        return "confirmed" if recovered else None
 
     if basket_slot_conflict_detected(body_text):
         raise BasketRecoveryError(
@@ -2066,7 +2240,11 @@ async def book_best_available_slot(
             logger,
             claim_slot,
         )
-        if outcome in {"unconfirmed", "lease-rejected"}:
+        if outcome in {
+            "unconfirmed",
+            "lease-rejected",
+            "overbooking-rejected",
+        }:
             if release_slot is not None and release_slot(slot):
                 logger.info(
                     "Released the coordinated claim for %s after a definitive failed attempt.",
@@ -2084,6 +2262,13 @@ async def book_best_available_slot(
                     target_date,
                     config,
                     logger,
+                )
+            elif outcome == "overbooking-rejected":
+                logger.warning(
+                    "Final checkout was explicitly rejected for %s; the matching "
+                    "basket item was cleared and the calendar restored, so "
+                    "continuing to the next preferred slot.",
+                    slot.label,
                 )
             else:
                 logger.warning(
@@ -2801,20 +2986,7 @@ async def run_booking() -> int:
                 except PlaywrightError as exc:
                     logger.warning("Failed to close browser cleanly: %s", exc)
 
-    if email_notifications_enabled() and not config.dry_run:
-        try:
-            await asyncio.to_thread(
-                send_booking_report,
-                log_path,
-                LOGS_DIR,
-                config.timezone_name,
-                logger,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to send booking report email: %s", exc)
-    elif config.dry_run:
-        logger.info("Skipping booking report email because DRY_RUN=true.")
-
+    logger.info("Booking run completed; exit_code=%d", exit_code)
     return exit_code
 
 

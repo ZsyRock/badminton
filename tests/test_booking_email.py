@@ -233,7 +233,7 @@ def test_build_report_colours_complete_pair_green_and_other_days_yellow():
 
     assert subject == "[Badminton Booking Report] Mon 20 Jul - Tue 21 Jul"
     assert (
-        "The slot booking result for Monday, 20 July is:\n"
+        "Today's playable slots are:\n"
         "17:00 and 18:00 at Court 4."
     ) in plain_body
     assert "Account A" not in plain_body
@@ -245,7 +245,7 @@ def test_build_report_colours_complete_pair_green_and_other_days_yellow():
     assert 'background:#e2f0d9' in html_body
     assert 'background:#fff2cc' in html_body
     assert (
-        "The slot booking result for Monday, 20 July is:<br>"
+        "Today&#x27;s playable slots are:<br>"
         '<span style="background:#e2f0d9;padding:3px 6px">'
         "17:00 and 18:00 at Court 4</span>."
     ) in html_body
@@ -312,7 +312,8 @@ def test_build_report_omits_historical_slots_outside_target_hours_from_table():
     assert ">Court 1</td>" in html_body
     assert "20:00:" not in plain_body
     assert ">20:00</th>" not in html_body
-    assert "Court 2" not in html_body
+    table_html = html_body.split("<h2>Playable Slots Summary</h2>", 1)[1]
+    assert "Court 2" not in table_html
 
 
 def test_build_report_merges_multiple_courts_in_the_same_time_cell():
@@ -331,33 +332,38 @@ def test_build_report_merges_multiple_courts_in_the_same_time_cell():
     assert "Court 1<br>Court 2" not in html_body
 
 
-def test_build_report_lists_same_time_courts_by_time_in_result_summary():
+def test_build_report_lists_todays_same_time_courts_in_playable_summary():
     report_date = date(2026, 8, 21)
     target_date = date(2026, 8, 30)
-    bookings = (
-        ConfirmedBooking(target_date, "账号A", "18:00", 1),
-        ConfirmedBooking(target_date, "账号B", "18:00", 2),
-        ConfirmedBooking(target_date, "账号C", "17:00", 1),
+    todays_bookings = (
+        ConfirmedBooking(report_date, "账号A", "17:00", 1),
+        ConfirmedBooking(report_date, "账号B", "18:00", 1),
+        ConfirmedBooking(report_date, "账号C", "18:00", 2),
+    )
+    latest_run_bookings = (
+        ConfirmedBooking(target_date, "账号A", "15:00", 4),
+        ConfirmedBooking(target_date, "账号B", "16:00", 3),
+        ConfirmedBooking(target_date, "账号C", "17:00", 2),
     )
     run_results = tuple(
         AccountRunResult(booking.account_label, target_date, booking, "confirmed")
-        for booking in bookings
+        for booking in latest_run_bookings
     )
 
     subject, plain_body, html_body = build_report(
         run_results,
-        bookings,
+        todays_bookings + latest_run_bookings,
         report_date,
     )
 
     assert subject == "[Badminton Booking Report] Fri 21 Aug - Sun 30 Aug"
     assert (
-        "The slot booking result for next Sunday, 30 August is:\n"
+        "Today's playable slots are:\n"
         "17:00 at Court 1,\n"
         "18:00 at Court 1 and 2."
     ) in plain_body
     assert (
-        "The slot booking result for next Sunday, 30 August is:<br>"
+        "Today&#x27;s playable slots are:<br>"
         '<span style="background:#e2f0d9;padding:3px 6px">'
         "17:00 at Court 1</span>,<br>"
         '<span style="background:#e2f0d9;padding:3px 6px">'
@@ -366,6 +372,37 @@ def test_build_report_lists_same_time_courts_by_time_in_result_summary():
     assert "18:00: Court 1 + 2" in plain_body
     assert ">Court 1 + 2</td>" in html_body
     assert "17:00 and 18:00 at Court 1" not in plain_body
+    assert "15:00 at Court 4" not in plain_body.split("Playable Slots Summary", 1)[0]
+
+
+def test_build_report_says_when_no_slots_are_booked_for_today():
+    report_date = date(2026, 8, 21)
+    target_date = date(2026, 8, 30)
+    future_booking = ConfirmedBooking(target_date, "账号A", "18:00", 1)
+
+    _, plain_body, html_body = build_report(
+        (
+            AccountRunResult(
+                "账号A",
+                target_date,
+                future_booking,
+                "confirmed",
+            ),
+        ),
+        (future_booking,),
+        report_date,
+    )
+
+    assert (
+        "Today's playable slots are:\n"
+        "No slots are booked for today."
+    ) in plain_body
+    assert (
+        "Today&#x27;s playable slots are:<br>"
+        '<span style="background:#fff2cc;padding:3px 6px">'
+        "No slots are booked for today.</span>"
+    ) in html_body
+    assert ">Court 1</td>" in html_body
 
 
 def test_build_report_caps_each_date_to_one_slot_per_account():
