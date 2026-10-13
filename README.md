@@ -5,10 +5,10 @@ Python Playwright automation for booking badminton courts on Southampton Sport G
 ## Production Rules
 
 - Target date = current `Europe/London` date + 8 days
-- Primary wave: `账号C` targets `17:00`, while `账号A` and `账号B` target
+- Primary wave: `account C` targets `17:00`, while `account A` and `account B` target
   separate Courts at `18:00`; this aims for one `17:00` slot plus two `18:00`
   slots
-- `账号A` and `账号C` use Court order `1 → 2 → 3 → 4`; `账号B` uses
+- `account A` and `account C` use Court order `1 → 2 → 3 → 4`; `account B` uses
   `2 → 1 → 3 → 4` and skips the exact `18:00` Court already selected by A
 - If the primary wave is incomplete, an unbooked account dynamically fills an
   adjacent time. The scheduler first preserves a consecutive two-hour block,
@@ -109,16 +109,16 @@ Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_S
 - `TIMEZONE`: keep `Europe/London` in production
 - `HEADLESS=true`: run without a visible browser
 - `DRY_RUN=true`: safe test mode, never confirms a booking
-- `PREFERRED_TIMES`: comma-separated search window times for `账号A`
-- `PREFERRED_COURTS`: comma-separated court priority for `账号A`
+- `PREFERRED_TIMES`: comma-separated search window times for `account A`
+- `PREFERRED_COURTS`: comma-separated court priority for `account A`
 - `SECONDARY_BOOKING_ENABLED=true`: enable an optional second booking account in parallel
 - `SECONDARY_GYM_USERNAME` / `SECONDARY_GYM_PASSWORD`: credentials for the optional second account
-- `SECONDARY_PREFERRED_TIMES`: comma-separated search window times for `账号B`
-- `SECONDARY_PREFERRED_COURTS`: comma-separated court priority for `账号B`
-- `TERTIARY_BOOKING_ENABLED=true`: enable `账号C` in parallel
-- `TERTIARY_GYM_USERNAME` / `TERTIARY_GYM_PASSWORD`: credentials for `账号C`
-- `TERTIARY_PREFERRED_TIMES`: comma-separated search window times for `账号C`
-- `TERTIARY_PREFERRED_COURTS`: comma-separated court priority for `账号C`
+- `SECONDARY_PREFERRED_TIMES`: comma-separated search window times for `account B`
+- `SECONDARY_PREFERRED_COURTS`: comma-separated court priority for `account B`
+- `TERTIARY_BOOKING_ENABLED=true`: enable `account C` in parallel
+- `TERTIARY_GYM_USERNAME` / `TERTIARY_GYM_PASSWORD`: credentials for `account C`
+- `TERTIARY_PREFERRED_TIMES`: comma-separated search window times for `account C`
+- `TERTIARY_PREFERRED_COURTS`: comma-separated court priority for `account C`
 - `BOOKING_EMAIL_ENABLED=true`: enable the HTML booking report sent by the separate daily 10:00 London-time job
 - `BOOKING_EMAIL_REFERENCE_SCRIPT`: optional path to the existing IP email script; its sender, Gmail app password, and recipient are read without executing the script
 - `BOOKING_EMAIL_FROM`, `BOOKING_EMAIL_APP_PASSWORD`, `BOOKING_EMAIL_APP_PASSWORD_FILE`, `BOOKING_EMAIL_TO`: optional explicit SMTP settings that take precedence over the reference script; the password-file option keeps the secret outside `.env`, and multiple recipients are comma-separated
