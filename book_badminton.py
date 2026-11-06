@@ -128,6 +128,7 @@ class BookingCoordinator:
 @dataclass
 class AccountRunProgress:
     completed_times: set[str] = field(default_factory=set)
+    pending_basket_slot: SlotPreference | None = None
 
 
 class AccountLoggerAdapter(logging.LoggerAdapter):
@@ -136,7 +137,16 @@ class AccountLoggerAdapter(logging.LoggerAdapter):
 
 
 class BasketRecoveryError(RuntimeError):
-    """Raised when a submitted slot is in the basket but cannot be safely confirmed."""
+    """Raised when a submitted slot needs another session to finish checkout."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        slot: SlotPreference | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.slot = slot
 
 
 class AccessBlockerError(RuntimeError):
@@ -430,6 +440,13 @@ def derive_login_url(booking_url: str) -> str:
     if "/account" in booking_url:
         return booking_url.replace("/account", DEFAULT_LOGIN_PATH)
     return booking_url.rstrip("/") + DEFAULT_LOGIN_PATH
+
+
+def derive_site_url(reference_url: str, path: str) -> str:
+    parsed_url = urlsplit(reference_url)
+    if not parsed_url.scheme or not parsed_url.netloc:
+        raise ValueError(f"Cannot derive a site URL from {reference_url!r}.")
+    return f"{parsed_url.scheme}://{parsed_url.netloc}/{path.lstrip('/')}"
 
 
 def is_book_page_url(url: str) -> bool:
@@ -1633,52 +1650,34 @@ async def require_single_expected_zero_price_basket_item(
     if basket_item_count != 1:
         raise BasketRecoveryError(
             f"Expected exactly one basket item for {slot.label}, but found "
-            f"{basket_item_count}. Stopping to avoid changing an unrelated item."
+            f"{basket_item_count}. Retrying in a fresh session without changing "
+            "an unrelated item."
         )
 
     basket_item_text = await basket_item.inner_text(timeout=5_000)
     if not basket_contains_expected_slot(basket_item_text, slot, target_date):
         raise BasketRecoveryError(
-            f"The basket item did not match {slot.label}. Stopping to avoid "
-            "changing an unrelated item."
+            f"The basket item did not match {slot.label}. Retrying in a fresh "
+            "session without changing an unrelated item."
         )
     if "£0.00" not in basket_item_text:
         raise BasketRecoveryError(
             f"The basket for {slot.label} was not explicitly shown as £0.00. "
-            "Stopping instead of changing a paid basket item."
+            "Retrying without changing a paid basket item."
         )
     return basket_item
 
 
-async def discard_overbooked_basket_item_and_restore_calendar(
+async def remove_expected_zero_price_basket_item(
     page: Page,
     slot: SlotPreference,
     target_date: date,
-    calendar_url: str,
+    basket_url: str,
     config: AppConfig,
     logger: logging.Logger,
 ) -> None:
-    """Remove one explicitly rejected item, then restore the validated calendar."""
+    """Remove the one expected zero-price item without touching other baskets."""
 
-    parsed_calendar_url = urlsplit(calendar_url)
-    if not parsed_calendar_url.scheme or not parsed_calendar_url.netloc:
-        raise BasketRecoveryError(
-            f"Could not safely return to the calendar after {slot.label} was rejected."
-        )
-    try:
-        validate_calendar_target_date(
-            calendar_url,
-            target_date,
-            config.timezone_name,
-        )
-    except TargetDateValidationError as exc:
-        raise BasketRecoveryError(
-            f"The saved calendar URL for {slot.label} did not match the target date."
-        ) from exc
-
-    basket_url = (
-        f"{parsed_calendar_url.scheme}://{parsed_calendar_url.netloc}/book/basket"
-    )
     logger.warning(
         "Removing the rejected basket item for %s before trying another slot.",
         slot.label,
@@ -1693,7 +1692,8 @@ async def discard_overbooked_basket_item_and_restore_calendar(
         await check_for_access_blockers(page, config, logger)
         if "/book/basket" not in page.url.lower():
             raise BasketRecoveryError(
-                f"Could not reopen the basket after {slot.label} was rejected."
+                f"Could not reopen the basket after {slot.label} was rejected.",
+                slot=slot,
             )
 
         basket_item = await require_single_expected_zero_price_basket_item(
@@ -1721,9 +1721,61 @@ async def discard_overbooked_basket_item_and_restore_calendar(
         if remaining_basket_items != 0:
             raise BasketRecoveryError(
                 f"The rejected basket item for {slot.label} did not disappear. "
-                "Stopping before trying another slot."
+                "Retrying in a fresh session.",
+                slot=slot,
             )
         logger.info("Removed the explicitly rejected basket item for %s.", slot.label)
+    except AccessBlockerError:
+        raise
+    except BasketRecoveryError as exc:
+        if exc.slot is None:
+            exc.slot = slot
+        raise
+    except Exception as exc:  # noqa: BLE001 - basket mutation is a recovery boundary
+        raise BasketRecoveryError(
+            f"Could not clear the rejected basket item for {slot.label}.",
+            slot=slot,
+        ) from exc
+
+
+async def discard_overbooked_basket_item_and_restore_calendar(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+    calendar_url: str,
+    config: AppConfig,
+    logger: logging.Logger,
+) -> None:
+    """Remove one explicitly rejected item, then restore the validated calendar."""
+
+    parsed_calendar_url = urlsplit(calendar_url)
+    if not parsed_calendar_url.scheme or not parsed_calendar_url.netloc:
+        raise BasketRecoveryError(
+            f"Could not safely return to the calendar after {slot.label} was rejected.",
+            slot=slot,
+        )
+    try:
+        validate_calendar_target_date(
+            calendar_url,
+            target_date,
+            config.timezone_name,
+        )
+    except TargetDateValidationError as exc:
+        raise BasketRecoveryError(
+            f"The saved calendar URL for {slot.label} did not match the target date.",
+            slot=slot,
+        ) from exc
+
+    basket_url = derive_site_url(calendar_url, "/book/basket")
+    try:
+        await remove_expected_zero_price_basket_item(
+            page,
+            slot,
+            target_date,
+            basket_url,
+            config,
+            logger,
+        )
 
         await page.goto(calendar_url, wait_until="domcontentloaded")
         await wait_for_network_idle_best_effort(
@@ -1742,58 +1794,37 @@ async def discard_overbooked_basket_item_and_restore_calendar(
             "Revalidated available-spaces calendar date after basket cleanup: %s",
             format_date_for_site(target_date),
         )
-    except (AccessBlockerError, BasketRecoveryError):
+    except AccessBlockerError:
+        raise
+    except BasketRecoveryError as exc:
+        if exc.slot is None:
+            exc.slot = slot
         raise
     except Exception as exc:  # noqa: BLE001 - basket mutation is a safety boundary
         raise BasketRecoveryError(
             f"Could not safely clear the rejected basket item for {slot.label} and "
-            "restore the booking calendar."
+            "restore the booking calendar.",
+            slot=slot,
         ) from exc
 
 
-async def recover_pending_basket_booking(
+async def complete_pending_zero_price_basket_checkout(
     page: Page,
     slot: SlotPreference,
     target_date: date,
     config: AppConfig,
     account: BookingAccountConfig,
     logger: logging.Logger,
+    *,
+    calendar_url: str | None,
 ) -> str:
-    """Complete the site's zero-price checkout for exactly one known basket item."""
-
-    calendar_url = page.url
-    logger.warning(
-        "%s was added to the basket without reaching confirmation; attempting the "
-        "site's zero-price basket checkout.",
-        slot.label,
-    )
+    """Complete one validated zero-price basket item from the basket page."""
 
     try:
-        go_to_basket = page.locator("#go-to-basket-btn").first
-        await go_to_basket.wait_for(state="visible", timeout=5_000)
-        await go_to_basket.click()
-        await page.wait_for_url(
-            re.compile(r"/book/(?:basket|success)(?:[/?#]|$)", re.IGNORECASE),
-            timeout=10_000,
-        )
-        await wait_for_network_idle_best_effort(
-            page,
-            logger,
-            "opening the basket",
-        )
-        await check_for_access_blockers(page, config, logger)
-
-        arrival_body = await read_page_body_text(page)
-        if booking_confirmation_detected(page.url, arrival_body):
-            logger.info(
-                "Booking confirmation appeared while opening the basket for %s.",
-                slot.label,
-            )
-            return "confirmed"
-
         if "/book/basket" not in page.url.lower():
             raise BasketRecoveryError(
-                f"The basket link for {slot.label} did not open the expected basket page."
+                f"The recovery for {slot.label} did not reach the expected basket page.",
+                slot=slot,
             )
 
         await require_single_expected_zero_price_basket_item(
@@ -1828,7 +1859,8 @@ async def recover_pending_basket_booking(
         if "/book/checkout" not in page.url.lower():
             raise BasketRecoveryError(
                 f"The basket checkout for {slot.label} did not open the expected "
-                "checkout page."
+                "checkout page.",
+                slot=slot,
             )
 
         submit_no_price = page.locator("#submit-no-price-btn").first
@@ -1841,11 +1873,14 @@ async def recover_pending_basket_booking(
             logger,
             "submitting zero-price basket confirmation",
         )
-    except BasketRecoveryError:
+    except BasketRecoveryError as exc:
+        if exc.slot is None:
+            exc.slot = slot
         raise
     except PlaywrightError as exc:
         raise BasketRecoveryError(
-            f"Could not complete the basket recovery controls for {slot.label}: {exc}"
+            f"Could not complete the basket recovery controls for {slot.label}: {exc}",
+            slot=slot,
         ) from exc
 
     if await wait_for_booking_confirmation_page(
@@ -1868,28 +1903,153 @@ async def recover_pending_basket_booking(
         )
         return "confirmed"
 
-    if (
-        overbooking_error_count(post_checkout_body)
-        > overbooking_error_baseline
-    ):
+    if overbooking_error_count(post_checkout_body) > overbooking_error_baseline:
         logger.warning(
             "Final checkout explicitly rejected %s because the space was no longer "
             "available.",
             slot.label,
         )
-        await discard_overbooked_basket_item_and_restore_calendar(
-            page,
-            slot,
-            target_date,
-            calendar_url,
-            config,
-            logger,
-        )
+        if calendar_url is not None:
+            await discard_overbooked_basket_item_and_restore_calendar(
+                page,
+                slot,
+                target_date,
+                calendar_url,
+                config,
+                logger,
+            )
+        else:
+            await remove_expected_zero_price_basket_item(
+                page,
+                slot,
+                target_date,
+                derive_site_url(config.booking_url, "/book/basket"),
+                config,
+                logger,
+            )
         return "overbooking-rejected"
 
     raise BasketRecoveryError(
         f"Basket checkout for {slot.label} was submitted, but no explicit booking "
-        "confirmation was detected. Stopping to avoid a duplicate booking."
+        "confirmation was detected. Retrying with a fresh login.",
+        slot=slot,
+    )
+
+
+async def recover_pending_basket_booking(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+) -> str:
+    """Open and complete the zero-price basket created by the current session."""
+
+    calendar_url = page.url
+    logger.warning(
+        "%s was added to the basket without reaching confirmation; attempting the "
+        "site's zero-price basket checkout.",
+        slot.label,
+    )
+
+    try:
+        go_to_basket = page.locator("#go-to-basket-btn").first
+        await go_to_basket.wait_for(state="visible", timeout=5_000)
+        await go_to_basket.click()
+        await page.wait_for_url(
+            re.compile(r"/book/(?:basket|success)(?:[/?#]|$)", re.IGNORECASE),
+            timeout=10_000,
+        )
+        await wait_for_network_idle_best_effort(page, logger, "opening the basket")
+        await check_for_access_blockers(page, config, logger)
+
+        arrival_body = await read_page_body_text(page)
+        if booking_confirmation_detected(page.url, arrival_body):
+            logger.info(
+                "Booking confirmation appeared while opening the basket for %s.",
+                slot.label,
+            )
+            return "confirmed"
+        if "/book/basket" not in page.url.lower():
+            raise BasketRecoveryError(
+                f"The basket link for {slot.label} did not open the expected basket page.",
+                slot=slot,
+            )
+    except BasketRecoveryError:
+        raise
+    except PlaywrightError as exc:
+        raise BasketRecoveryError(
+            f"Could not open the basket recovery controls for {slot.label}: {exc}",
+            slot=slot,
+        ) from exc
+
+    return await complete_pending_zero_price_basket_checkout(
+        page,
+        slot,
+        target_date,
+        config,
+        account,
+        logger,
+        calendar_url=calendar_url,
+    )
+
+
+async def resume_pending_basket_booking_after_login(
+    page: Page,
+    slot: SlotPreference,
+    target_date: date,
+    config: AppConfig,
+    account: BookingAccountConfig,
+    logger: logging.Logger,
+) -> str:
+    """Retry an unfinished basket first after creating a fresh authenticated session."""
+
+    logger.warning(
+        "Fresh session will resume the unfinished basket checkout for %s before "
+        "searching for another slot.",
+        slot.label,
+    )
+    try:
+        basket_url = derive_site_url(config.booking_url, "/book/basket")
+        await page.goto(basket_url, wait_until="domcontentloaded")
+        await wait_for_network_idle_best_effort(
+            page,
+            logger,
+            "resuming the basket after a fresh login",
+        )
+        await check_for_access_blockers(page, config, logger)
+        if "/book/basket" not in page.url.lower():
+            raise BasketRecoveryError(
+                f"Could not reopen the unfinished basket for {slot.label}.",
+                slot=slot,
+            )
+
+        await page.locator("body").wait_for(state="visible", timeout=10_000)
+        basket_item_count = await page.locator(".basket-item").count()
+        if basket_item_count == 0:
+            logger.warning(
+                "The unfinished basket item for %s is no longer present; resuming "
+                "the normal slot priority from the incomplete phase.",
+                slot.label,
+            )
+            return "basket-empty"
+    except BasketRecoveryError:
+        raise
+    except (PlaywrightError, ValueError) as exc:
+        raise BasketRecoveryError(
+            f"Could not reopen the unfinished basket for {slot.label}: {exc}",
+            slot=slot,
+        ) from exc
+
+    return await complete_pending_zero_price_basket_checkout(
+        page,
+        slot,
+        target_date,
+        config,
+        account,
+        logger,
+        calendar_url=None,
     )
 
 
@@ -1906,12 +2066,12 @@ async def recover_basket_state_if_present(
     except PlaywrightError as exc:
         raise BasketRecoveryError(
             f"Could not inspect the page after the unconfirmed attempt for "
-            f"{slot.label}. Stopping to avoid a duplicate booking."
+            f"{slot.label}. Retrying with a fresh login."
         ) from exc
     if not body_text.strip():
         raise BasketRecoveryError(
             f"The page was blank after the unconfirmed attempt for {slot.label}. "
-            "Stopping to avoid a duplicate booking."
+            "Retrying with a fresh login."
         )
 
     if booking_confirmation_detected(page.url, body_text):
@@ -1935,8 +2095,8 @@ async def recover_basket_state_if_present(
     if basket_slot_conflict_detected(body_text):
         raise BasketRecoveryError(
             f"The site reports that the {slot.start_time} slot is already in the "
-            "basket, but it was not added by this recoverable attempt. Stopping to "
-            "avoid confirming or creating a duplicate booking."
+            "basket, but it was not added by this recoverable attempt. Retrying the "
+            "existing basket with a fresh login."
         )
 
     return None
@@ -1966,8 +2126,7 @@ async def recover_or_stop_after_unknown_final_action(
     except Exception as recovery_exc:  # noqa: BLE001 - final-submit safety boundary
         raise BasketRecoveryError(
             f"The final booking action for {slot.label} ended in an unknown state, "
-            "and the page could not be inspected safely. Stopping to avoid a "
-            "duplicate booking."
+            "and the page could not be inspected. Retrying with a fresh login."
         ) from recovery_exc
 
     if recovered_outcome is not None:
@@ -1990,7 +2149,7 @@ async def recover_or_stop_after_unknown_final_action(
 
     raise BasketRecoveryError(
         f"The final booking action for {slot.label} ended in an unknown state. "
-        "Stopping to avoid a duplicate booking."
+        "Retrying with a fresh login."
     ) from cause
 
 
@@ -2104,7 +2263,7 @@ async def try_book_slot(
     if lease_error_baseline is None:
         logger.warning(
             "Could not establish the pre-submit lease-error state for %s; any "
-            "unconfirmed result will retain the existing duplicate-booking safety stop.",
+            "unconfirmed result will use the bounded fresh-session recovery path.",
             slot.label,
         )
 
@@ -2178,8 +2337,7 @@ async def try_book_slot(
 
         raise BasketRecoveryError(
             f"The final booking action for {slot.label} produced neither a "
-            "confirmation nor a recoverable basket item. Stopping to avoid a "
-            "duplicate booking."
+            "confirmation nor a recoverable basket item. Retrying with a fresh login."
         )
     except (AccessBlockerError, BasketRecoveryError):
         raise
@@ -2230,16 +2388,21 @@ async def book_best_available_slot(
 
     last_unconfirmed_slot: SlotPreference | None = None
     for slot in preferences:
-        outcome = await try_book_slot(
-            page,
-            slot.start_time,
-            slot.court_number,
-            target_date,
-            config,
-            account,
-            logger,
-            claim_slot,
-        )
+        try:
+            outcome = await try_book_slot(
+                page,
+                slot.start_time,
+                slot.court_number,
+                target_date,
+                config,
+                account,
+                logger,
+                claim_slot,
+            )
+        except BasketRecoveryError as exc:
+            if exc.slot is None:
+                exc.slot = slot
+            raise
         if outcome in {
             "unconfirmed",
             "lease-rejected",
@@ -2616,6 +2779,36 @@ async def run_account_booking_session(
             attempt_number,
             perf_counter() - booking_flow_started_at,
         )
+
+        if progress.pending_basket_slot is not None:
+            pending_slot = progress.pending_basket_slot
+            recovery_outcome = await resume_pending_basket_booking_after_login(
+                page,
+                pending_slot,
+                target_date,
+                config,
+                account,
+                logger,
+            )
+            if recovery_outcome == "confirmed":
+                progress.pending_basket_slot = None
+                return BookingAttemptResult(
+                    slot=pending_slot,
+                    outcome="confirmed",
+                )
+            if recovery_outcome in {"basket-empty", "overbooking-rejected"}:
+                release_slot_for_account(
+                    coordinator,
+                    account.key,
+                    pending_slot,
+                )
+                progress.pending_basket_slot = None
+                logger.info(
+                    "The unfinished basket for %s no longer blocks another attempt; "
+                    "continuing the normal slot priority.",
+                    pending_slot.label,
+                )
+
         await open_booking_search(page, config, logger)
 
         local_now = get_local_now(config.timezone_name)
@@ -2868,10 +3061,32 @@ async def run_account_booking(
                     progress,
                     attempt_number,
                 )
+            except BasketRecoveryError as exc:
+                if exc.slot is not None:
+                    progress.pending_basket_slot = exc.slot
+                if attempt_number >= MAX_ACCOUNT_SESSION_ATTEMPTS:
+                    logger.exception(
+                        "Booking run failed after %s basket recovery sessions: %s",
+                        MAX_ACCOUNT_SESSION_ATTEMPTS,
+                        exc,
+                    )
+                    return 1
+                logger.exception(
+                    "Basket recovery session %s/%s did not finish: %s",
+                    attempt_number,
+                    MAX_ACCOUNT_SESSION_ATTEMPTS,
+                    exc,
+                )
+                logger.info(
+                    "Closing the stuck checkout and retrying the unfinished booking "
+                    "with a fresh login in %ss.",
+                    ACCOUNT_RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(ACCOUNT_RETRY_DELAY_SECONDS)
+                continue
             except (
                 AccessBlockerError,
                 AuthenticationError,
-                BasketRecoveryError,
                 ValueError,
                 TypeError,
                 AssertionError,

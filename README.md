@@ -181,8 +181,10 @@ If the site adds a selected slot to the basket but does not reach the normal suc
 page, the script preserves the original Court choice and completes the site's
 zero-price Basket → Checkout → Confirm flow. It verifies that the basket contains
 exactly one item matching the attempted Court and time before confirming. If the
-basket state is ambiguous, that account stops safely instead of risking a duplicate
-booking or blindly moving to another Court.
+checkout becomes stuck, the account closes that browser session, logs in again, and
+reopens the unfinished basket before searching for another slot. If the basket item
+has expired or disappeared, the account resumes the incomplete phase in its normal
+Court order. This recovery remains bounded to three total sessions.
 
 If Gladstone explicitly returns `ACTIVITY-CALENDAR.ERRORS.CREATE-LEASE` only after
 the current final click, and a second state check finds neither a confirmation nor
@@ -191,11 +193,11 @@ only that account's exact-slot claim, refreshes the calendar, revalidates the ta
 date, and continues in the configured Court and fallback-time order. A stale error
 left by an earlier SPA action is not treated as a new rejection.
 
-For page timeouts or other transient browser failures before an ambiguous final
-submission, the failed page and browser context are closed and the account logs in
-again. Each account gets at most three total sessions. CAPTCHA, rate limiting,
-explicit login rejection, and uncertain post-submit states stop immediately rather
-than creating repeated login or duplicate-booking risk.
+For page timeouts, stuck zero-price checkout controls, or other transient browser
+failures, the failed page and browser context are closed and the account logs in
+again. Each account gets at most three total sessions. CAPTCHA, rate limiting, and
+explicit login rejection still stop immediately rather than triggering repeated
+login attempts.
 
 ## Manual Runs
 

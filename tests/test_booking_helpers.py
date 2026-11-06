@@ -177,6 +177,17 @@ class StatefulBasketPage:
             )
 
 
+class ResumableBasketPage(StatefulBasketPage):
+    def __init__(self):
+        super().__init__()
+        self.state = "basket"
+        self.url = "https://example.test/book/basket"
+
+    async def goto(self, url, **_kwargs):
+        self.state = "basket"
+        self.url = url
+
+
 class OverbookingBasketPage(StatefulBasketPage):
     def __init__(self, *, stale_marker=False):
         super().__init__()
@@ -1086,6 +1097,41 @@ def test_recover_pending_basket_booking_completes_zero_price_checkout(monkeypatc
 
     assert recovered == "confirmed"
     assert page.go_to_basket.click_count == 1
+    assert page.continue_to_payment.click_count == 1
+    assert page.submit_no_price.click_count == 1
+    assert page.state == "submitted"
+
+
+def test_resume_pending_basket_after_fresh_login_completes_checkout(monkeypatch):
+    config, account, logger = make_test_booking_context()
+    slot = SlotPreference("19:00", 1)
+    page = ResumableBasketPage()
+
+    async def no_access_blockers(*_args, **_kwargs):
+        return None
+
+    async def confirmation_detected(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(book_badminton, "check_for_access_blockers", no_access_blockers)
+    monkeypatch.setattr(
+        book_badminton,
+        "wait_for_booking_confirmation_page",
+        confirmation_detected,
+    )
+
+    recovered = asyncio.run(
+        book_badminton.resume_pending_basket_booking_after_login(
+            page,
+            slot,
+            date(2026, 8, 11),
+            config,
+            account,
+            logger,
+        )
+    )
+
+    assert recovered == "confirmed"
     assert page.continue_to_payment.click_count == 1
     assert page.submit_no_price.click_count == 1
     assert page.state == "submitted"
@@ -2436,6 +2482,80 @@ def test_transient_failure_uses_fresh_login_and_resumes_incomplete_phase(monkeyp
         "16:00",
     ]
     assert [slot.court_number for slot in phase_calls[-1][1]] == [1, 2, 3, 4]
+
+
+def test_stuck_basket_uses_fresh_login_and_finishes_existing_booking(monkeypatch):
+    config, account, coordinator, logger = make_retry_test_context()
+    browser = RetryTestBrowser()
+    pending_slot = SlotPreference("17:00", 1)
+    login_calls = []
+    search_page_calls = []
+    phase_calls = []
+    resume_calls = []
+
+    async def successful_login(*_args, **_kwargs):
+        login_calls.append(True)
+
+    async def open_search(*_args, **_kwargs):
+        search_page_calls.append(True)
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def no_screenshot(*_args, **_kwargs):
+        return None
+
+    async def stuck_checkout(*_args, **kwargs):
+        phase_calls.append(kwargs["phase_name"])
+        assert kwargs["claim_slot"](pending_slot)
+        raise book_badminton.BasketRecoveryError(
+            "zero-price Confirm stayed disabled",
+            slot=pending_slot,
+        )
+
+    async def resume_existing_basket(
+        _page,
+        slot,
+        target_date,
+        _config,
+        resumed_account,
+        _logger,
+    ):
+        resume_calls.append((slot, target_date, resumed_account.key))
+        return "confirmed"
+
+    monkeypatch.setattr(book_badminton, "login", successful_login)
+    monkeypatch.setattr(book_badminton, "open_booking_search", open_search)
+    monkeypatch.setattr(book_badminton, "search_badminton", no_op)
+    monkeypatch.setattr(book_badminton, "open_available_spaces", no_op)
+    monkeypatch.setattr(book_badminton, "book_best_available_slot", stuck_checkout)
+    monkeypatch.setattr(
+        book_badminton,
+        "resume_pending_basket_booking_after_login",
+        resume_existing_basket,
+    )
+    monkeypatch.setattr(book_badminton, "save_failure_screenshot", no_screenshot)
+    monkeypatch.setattr(book_badminton, "ACCOUNT_RETRY_DELAY_SECONDS", 0)
+
+    exit_code = asyncio.run(
+        book_badminton.run_account_booking(
+            browser,
+            config,
+            account,
+            logger,
+            coordinator,
+        )
+    )
+
+    assert exit_code == 0
+    assert len(login_calls) == 2
+    assert search_page_calls == [True]
+    assert phase_calls == ["17:00"]
+    assert resume_calls == [
+        (pending_slot, coordinator.target_date, account.key),
+    ]
+    assert len(browser.contexts) == 2
+    assert all(context.closed and context.page.closed for context in browser.contexts)
 
 
 def test_transient_failure_stops_after_three_fresh_sessions(monkeypatch):
