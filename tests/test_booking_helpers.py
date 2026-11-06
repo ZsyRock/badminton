@@ -301,16 +301,21 @@ def clear_booking_env(monkeypatch):
         "DEBUG_PAUSE_SECONDS",
         "PREFERRED_TIMES",
         "PREFERRED_COURTS",
+        "PRIMARY_BOOKING_ENABLED",
+        "PRIMARY_BOOKING_TIME",
+        "BOOKING_FALLBACK_TIMES",
         "SECONDARY_BOOKING_ENABLED",
         "SECONDARY_GYM_USERNAME",
         "SECONDARY_GYM_PASSWORD",
         "SECONDARY_PREFERRED_TIMES",
         "SECONDARY_PREFERRED_COURTS",
+        "SECONDARY_PRIMARY_BOOKING_TIME",
         "TERTIARY_BOOKING_ENABLED",
         "TERTIARY_GYM_USERNAME",
         "TERTIARY_GYM_PASSWORD",
         "TERTIARY_PREFERRED_TIMES",
         "TERTIARY_PREFERRED_COURTS",
+        "TERTIARY_PRIMARY_BOOKING_TIME",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -396,6 +401,45 @@ def test_load_config_disables_optional_accounts_when_flags_are_false(monkeypatch
     config = load_config()
 
     assert [account.label for account in config.accounts] == ["账号A"]
+
+
+def test_load_config_can_disable_primary_and_keep_secondary_account(monkeypatch):
+    monkeypatch.setattr(book_badminton, "load_dotenv", lambda dotenv_path: None)
+    clear_booking_env(monkeypatch)
+    monkeypatch.setenv("PRIMARY_BOOKING_ENABLED", "false")
+    monkeypatch.setenv("SECONDARY_BOOKING_ENABLED", "true")
+    monkeypatch.setenv("SECONDARY_GYM_USERNAME", "secondary@example.com")
+    monkeypatch.setenv("SECONDARY_GYM_PASSWORD", "secondary-password")
+
+    config = load_config()
+
+    assert [account.key for account in config.accounts] == [ACCOUNT_B_KEY]
+
+
+def test_load_config_allows_all_account_slots_to_be_disabled(monkeypatch):
+    monkeypatch.setattr(book_badminton, "load_dotenv", lambda dotenv_path: None)
+    clear_booking_env(monkeypatch)
+    monkeypatch.setenv("PRIMARY_BOOKING_ENABLED", "false")
+    monkeypatch.setenv("SECONDARY_BOOKING_ENABLED", "false")
+    monkeypatch.setenv("TERTIARY_BOOKING_ENABLED", "false")
+
+    config = load_config()
+
+    assert config.accounts == ()
+
+
+def test_load_config_uses_editable_primary_and_fallback_times(monkeypatch):
+    monkeypatch.setattr(book_badminton, "load_dotenv", lambda dotenv_path: None)
+    clear_booking_env(monkeypatch)
+    monkeypatch.setenv("GYM_USERNAME", "primary@example.com")
+    monkeypatch.setenv("GYM_PASSWORD", "primary-password")
+    monkeypatch.setenv("PRIMARY_BOOKING_TIME", "16:00")
+    monkeypatch.setenv("BOOKING_FALLBACK_TIMES", "17:00,15:00")
+
+    config = load_config()
+
+    assert book_badminton.get_account_primary_time(config.accounts[0]) == "16:00"
+    assert config.fallback_times == ("17:00", "15:00")
 
 
 def test_account_attempt_times_are_fixed_for_every_target_weekday():

@@ -10,6 +10,8 @@ screenshots/
 manual_bookings.json
 cancellation_reminder_state.json
 daily_report_state.json
+.booking_admin_token
+.booking_admin_password
 run_debug.txt
 *.pyc
 *.pyo

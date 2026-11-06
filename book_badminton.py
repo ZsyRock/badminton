@@ -91,6 +91,7 @@ class BookingAccountConfig:
     password: str
     search_window_times: tuple[str, ...]
     court_priority: tuple[int, ...]
+    primary_time: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ class AppConfig:
     debug_pause_seconds: int
     target_date_override: str | None
     accounts: tuple[BookingAccountConfig, ...]
+    fallback_times: tuple[str, ...] = FALLBACK_TIMES
 
 
 @dataclass(frozen=True)
@@ -515,7 +517,15 @@ def get_account_attempt_times(account_key: str) -> tuple[str, ...]:
         raise ValueError(f"Unsupported account key: {account_key}") from exc
 
 
-def get_account_primary_time(account_key: str) -> str:
+def get_account_primary_time(
+    account: str | BookingAccountConfig,
+) -> str:
+    if isinstance(account, BookingAccountConfig):
+        if account.primary_time is not None:
+            return account.primary_time
+        account_key = account.key
+    else:
+        account_key = account
     try:
         return ACCOUNT_PRIMARY_TIMES[account_key]
     except KeyError as exc:
@@ -610,6 +620,7 @@ def build_account_config(
     password: str,
     search_window_times: Sequence[str],
     court_priority: Sequence[int],
+    primary_time: str | None = None,
 ) -> BookingAccountConfig:
     normalized_username = username.strip()
     normalized_password = password.strip()
@@ -617,6 +628,12 @@ def build_account_config(
         raise ValueError(f"{label} username is required in .env")
     if not normalized_password:
         raise ValueError(f"{label} password is required in .env")
+    normalized_primary_time = primary_time or get_account_primary_time(key)
+    if normalized_primary_time not in TARGET_BOOKING_TIMES:
+        raise ValueError(
+            f"{label} primary booking time must be one of "
+            f"{', '.join(TARGET_BOOKING_TIMES)}"
+        )
 
     return BookingAccountConfig(
         key=key,
@@ -625,6 +642,7 @@ def build_account_config(
         password=normalized_password,
         search_window_times=build_search_window_times(key, search_window_times),
         court_priority=tuple(court_priority),
+        primary_time=normalized_primary_time,
     )
 
 
@@ -636,6 +654,25 @@ def load_config() -> AppConfig:
     dry_run = parse_bool(os.getenv("DRY_RUN"), default=True)
     debug_pause_seconds = parse_optional_int(os.getenv("DEBUG_PAUSE_SECONDS"), default=0)
     target_date_override = os.getenv("TARGET_DATE_OVERRIDE", "").strip() or None
+    fallback_times_value = os.getenv("BOOKING_FALLBACK_TIMES")
+    if fallback_times_value is None:
+        fallback_times = FALLBACK_TIMES
+    else:
+        fallback_times = tuple(
+            value
+            for value in parse_csv_strings(fallback_times_value, default=())
+            if value
+        )
+        invalid_fallback_times = [
+            value for value in fallback_times if value not in TARGET_BOOKING_TIMES
+        ]
+        if invalid_fallback_times:
+            raise ValueError(
+                "BOOKING_FALLBACK_TIMES contains unsupported values: "
+                + ", ".join(invalid_fallback_times)
+            )
+        if len(set(fallback_times)) != len(fallback_times):
+            raise ValueError("BOOKING_FALLBACK_TIMES must not contain duplicates")
     primary_search_window_times = parse_csv_strings(
         os.getenv("PREFERRED_TIMES"),
         default=ACCOUNT_ATTEMPT_TIMES[ACCOUNT_A_KEY],
@@ -644,16 +681,25 @@ def load_config() -> AppConfig:
         os.getenv("PREFERRED_COURTS"),
         default=(1, 2, 3, 4),
     )
-    accounts = [
-        build_account_config(
-            key=ACCOUNT_A_KEY,
-            label=ACCOUNT_A_LABEL,
-            username=os.getenv("GYM_USERNAME", ""),
-            password=os.getenv("GYM_PASSWORD", ""),
-            search_window_times=primary_search_window_times,
-            court_priority=primary_court_priority,
+    primary_username = os.getenv("GYM_USERNAME", "")
+    primary_password = os.getenv("GYM_PASSWORD", "")
+    primary_enabled = parse_bool(
+        os.getenv("PRIMARY_BOOKING_ENABLED"),
+        default=True,
+    )
+    accounts: list[BookingAccountConfig] = []
+    if primary_enabled:
+        accounts.append(
+            build_account_config(
+                key=ACCOUNT_A_KEY,
+                label=ACCOUNT_A_LABEL,
+                username=primary_username,
+                password=primary_password,
+                search_window_times=primary_search_window_times,
+                court_priority=primary_court_priority,
+                primary_time=os.getenv("PRIMARY_BOOKING_TIME", "").strip() or None,
+            )
         )
-    ]
 
     secondary_username = os.getenv("SECONDARY_GYM_USERNAME", "")
     secondary_password = os.getenv("SECONDARY_GYM_PASSWORD", "")
@@ -681,6 +727,9 @@ def load_config() -> AppConfig:
                 password=secondary_password,
                 search_window_times=secondary_search_window_times,
                 court_priority=secondary_court_priority,
+                primary_time=(
+                    os.getenv("SECONDARY_PRIMARY_BOOKING_TIME", "").strip() or None
+                ),
             )
         )
 
@@ -710,6 +759,9 @@ def load_config() -> AppConfig:
                 password=tertiary_password,
                 search_window_times=tertiary_search_window_times,
                 court_priority=tertiary_court_priority,
+                primary_time=(
+                    os.getenv("TERTIARY_PRIMARY_BOOKING_TIME", "").strip() or None
+                ),
             )
         )
 
@@ -721,6 +773,7 @@ def load_config() -> AppConfig:
         debug_pause_seconds=debug_pause_seconds,
         target_date_override=target_date_override,
         accounts=tuple(accounts),
+        fallback_times=fallback_times,
     )
 
 
@@ -2570,6 +2623,7 @@ def _longest_consecutive_run(start_times: Iterable[str]) -> int:
 def _fallback_time_score(
     start_time: str,
     occupied_time_counts: dict[str, int],
+    fallback_times: Sequence[str] = FALLBACK_TIMES,
 ) -> tuple[int, int, int, int, int, int]:
     """Rank a fallback by continuity first and the requested edge order last."""
 
@@ -2599,11 +2653,7 @@ def _fallback_time_score(
             for first, second, _ in available_pairs
         )
     )
-    requested_tie_break = {
-        "19:00": 3,
-        "16:00": 2,
-        "15:00": 1,
-    }[start_time]
+    requested_tie_break = len(fallback_times) - fallback_times.index(start_time)
     return (
         int(bool(available_pairs)),
         pair_priority,
@@ -2639,6 +2689,7 @@ def reserve_next_fallback_time(
     coordinator: BookingCoordinator,
     account_key: str,
     completed_times: set[str],
+    fallback_times: Sequence[str] = FALLBACK_TIMES,
 ) -> str | None:
     """Atomically reserve the best remaining fallback hour for one account."""
 
@@ -2649,7 +2700,7 @@ def reserve_next_fallback_time(
     occupied_time_counts = get_coordinated_time_counts(coordinator)
     candidates = [
         start_time
-        for start_time in FALLBACK_TIMES
+        for start_time in fallback_times
         if start_time not in completed_times
         and occupied_time_counts.get(start_time, 0) < 2
     ]
@@ -2658,17 +2709,26 @@ def reserve_next_fallback_time(
 
     if occupied_time_counts:
         candidates.sort(
-            key=lambda value: _fallback_time_score(value, occupied_time_counts),
+            key=lambda value: _fallback_time_score(
+                value,
+                occupied_time_counts,
+                fallback_times,
+            ),
             reverse=True,
         )
     else:
-        # With no surviving 17:00/18:00 anchor, 16:00 gives the other
-        # unbooked accounts the best chance to create a 15:00-17:00 pair.
-        empty_plan_priority = {"16:00": 3, "15:00": 2, "19:00": 1}
-        candidates.sort(
-            key=lambda value: empty_plan_priority[value],
-            reverse=True,
-        )
+        if tuple(fallback_times) == FALLBACK_TIMES:
+            # Preserve the established no-anchor plan: 16:00 gives the other
+            # unbooked accounts the best chance to create a 15:00-17:00 pair.
+            empty_plan_priority = {"16:00": 3, "15:00": 2, "19:00": 1}
+            candidates.sort(
+                key=lambda value: empty_plan_priority[value],
+                reverse=True,
+            )
+        else:
+            # A deliberately edited pool uses the administrator's drag order
+            # when there is no primary anchor to coordinate around.
+            candidates.sort(key=fallback_times.index)
 
     selected_time = candidates[0]
     coordinator.fallback_time_owners.setdefault(selected_time, set()).add(account_key)
@@ -2699,8 +2759,14 @@ def release_all_fallback_times_for_account(
         release_fallback_time_for_account(coordinator, account_key, start_time)
 
 
-def _account_is_configured(config: AppConfig, account_key: str) -> bool:
-    return any(account.key == account_key for account in config.accounts)
+def _configured_account(
+    config: AppConfig,
+    account_key: str,
+) -> BookingAccountConfig | None:
+    return next(
+        (account for account in config.accounts if account.key == account_key),
+        None,
+    )
 
 
 async def wait_for_primary_phase_decisions(
@@ -2714,7 +2780,7 @@ async def wait_for_primary_phase_decisions(
         get_phase_selection_event(
             coordinator,
             configured_account.key,
-            get_account_primary_time(configured_account.key),
+            get_account_primary_time(configured_account),
         )
         for configured_account in config.accounts
     ]
@@ -2851,7 +2917,7 @@ async def run_account_booking_session(
         )
 
         last_result: BookingAttemptResult | None = None
-        primary_time = get_account_primary_time(account.key)
+        primary_time = get_account_primary_time(account)
         while True:
             is_primary_phase = primary_time not in progress.completed_times
             if is_primary_phase:
@@ -2862,6 +2928,7 @@ async def run_account_booking_session(
                     coordinator,
                     account.key,
                     progress.completed_times,
+                    config.fallback_times,
                 )
                 if start_time is None:
                     logger.info("No untried coordinated fallback time remains.")
@@ -2877,7 +2944,10 @@ async def run_account_booking_session(
             if (
                 is_primary_phase
                 and account.key == ACCOUNT_B_KEY
-                and _account_is_configured(config, ACCOUNT_A_KEY)
+                and (
+                    account_a := _configured_account(config, ACCOUNT_A_KEY)
+                ) is not None
+                and get_account_primary_time(account_a) == start_time
             ):
                 account_a_selection = await wait_for_phase_selection(
                     coordinator,
@@ -3029,8 +3099,8 @@ async def run_account_booking(
     logger.info(
         "Primary booking time is %s; coordinated fallback pool is %s; court "
         "order is %s.",
-        get_account_primary_time(account.key),
-        " -> ".join(FALLBACK_TIMES),
+        get_account_primary_time(account),
+        " -> ".join(config.fallback_times) or "none",
         " -> ".join(str(court) for court in account.court_priority),
     )
     if coordinator.release_at is not None:
@@ -3147,8 +3217,14 @@ async def run_booking() -> int:
     logger.info("Log file: %s", log_path)
     logger.info(
         "Configured booking accounts: %s",
-        ", ".join(account.label for account in config.accounts),
+        ", ".join(account.label for account in config.accounts) or "none",
     )
+    if not config.accounts:
+        logger.info(
+            "No booking accounts are enabled; exiting without opening a browser."
+        )
+        logger.info("Booking run completed; exit_code=0")
+        return 0
 
     browser = None
     run_now = datetime.now(timezone.utc)

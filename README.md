@@ -81,6 +81,8 @@ Recommended production `.env`:
 BOOKING_URL=https://soton.gladstonego.cloud/account
 GYM_USERNAME=your-email@example.com
 GYM_PASSWORD=your-password
+PRIMARY_BOOKING_ENABLED=true
+PRIMARY_BOOKING_TIME=18:00
 TIMEZONE=Europe/London
 HEADLESS=true
 DRY_RUN=false
@@ -88,16 +90,19 @@ TARGET_DATE_OVERRIDE=
 DEBUG_PAUSE_SECONDS=
 PREFERRED_TIMES=15:00,16:00,17:00,18:00,19:00
 PREFERRED_COURTS=1,2,3,4
+BOOKING_FALLBACK_TIMES=19:00,16:00,15:00
 SECONDARY_BOOKING_ENABLED=false
 SECONDARY_GYM_USERNAME=
 SECONDARY_GYM_PASSWORD=
 SECONDARY_PREFERRED_TIMES=15:00,16:00,17:00,18:00,19:00
 SECONDARY_PREFERRED_COURTS=2,1,3,4
+SECONDARY_PRIMARY_BOOKING_TIME=18:00
 TERTIARY_BOOKING_ENABLED=false
 TERTIARY_GYM_USERNAME=
 TERTIARY_GYM_PASSWORD=
 TERTIARY_PREFERRED_TIMES=15:00,16:00,17:00,18:00,19:00
 TERTIARY_PREFERRED_COURTS=1,2,3,4
+TERTIARY_PRIMARY_BOOKING_TIME=17:00
 BOOKING_EMAIL_ENABLED=false
 BOOKING_EMAIL_REFERENCE_SCRIPT=/home/<YOUR_USERNAME>/send_ip_email.py
 ```
@@ -111,6 +116,9 @@ Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_S
 - `DRY_RUN=true`: safe test mode, never confirms a booking
 - `PREFERRED_TIMES`: comma-separated search window times for `account A`
 - `PREFERRED_COURTS`: comma-separated court priority for `account A`
+- `PRIMARY_BOOKING_ENABLED=false`: disable `account A` without making it mandatory
+- `PRIMARY_BOOKING_TIME`, `SECONDARY_PRIMARY_BOOKING_TIME`, `TERTIARY_PRIMARY_BOOKING_TIME`: per-account first-choice hours
+- `BOOKING_FALLBACK_TIMES`: enabled fallback-hour pool and tie-break order
 - `SECONDARY_BOOKING_ENABLED=true`: enable an optional second booking account in parallel
 - `SECONDARY_GYM_USERNAME` / `SECONDARY_GYM_PASSWORD`: credentials for the optional second account
 - `SECONDARY_PREFERRED_TIMES`: comma-separated search window times for `account B`
@@ -124,6 +132,34 @@ Keep credentials only in `.env`. Leave `TARGET_DATE_OVERRIDE` and `DEBUG_PAUSE_S
 - `BOOKING_EMAIL_FROM`, `BOOKING_EMAIL_APP_PASSWORD`, `BOOKING_EMAIL_APP_PASSWORD_FILE`, `BOOKING_EMAIL_TO`: optional explicit SMTP settings that take precedence over the reference script; the password-file option keeps the secret outside `.env`, and multiple recipients are comma-separated
 - `BOOKING_EMAIL_TEST_TO`: exactly one private recipient for manual report tests; test mode fails closed if this is empty or contains multiple addresses and never falls back to `BOOKING_EMAIL_TO`
 - `BOOKING_CANCELLATION_REMINDER_ENABLED=true`: enable calendar invitations during the final one-hour free-cancellation window
+
+## Local Account Control Page
+
+Start the loopback-only control page:
+
+```bash
+source .venv/bin/activate
+python booking_admin.py --print-url
+```
+
+Open the private URL printed by the command. The page can:
+
+- log out any account slot, immediately disabling it for future booking runs and removing its saved password;
+- add replacement credentials to an empty account slot;
+- change each account's primary time;
+- drag each account's Court priority into a new order;
+- tick and drag the coordinated fallback-hour pool; and
+- show the effective logic for the currently active account count.
+
+The server binds to `127.0.0.1` by default, never displays saved account
+passwords, and atomically writes the local `.env`. Public deployments can be
+protected with `python booking_admin.py --set-password` followed by the
+`--require-password` runtime flag; the password hash is stored only in the
+ignored `.booking_admin_password` file.
+Do not expose the loopback port directly to a public or campus network. Changes
+apply to the next booking run; an already running midnight browser session is not
+modified. A path-based reverse proxy can set `--base-path /another-name`; the
+default serves from the domain root.
 
 The daily email is sent at `10:00 Europe/London`, not at the end of the midnight
 booking run. Its opening section lists the slots that can be played on the report
@@ -220,7 +256,7 @@ HEADLESS=true DRY_RUN=false python book_badminton.py
 ```bash
 source .venv/bin/activate
 python -m pytest -q
-python -m py_compile book_badminton.py booking_daily_report.py booking_cancellation_reminder.py
+python -m py_compile book_badminton.py booking_admin.py booking_daily_report.py booking_cancellation_reminder.py
 ```
 
 ## Ubuntu Scheduling

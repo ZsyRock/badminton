@@ -1,0 +1,17 @@
+[Unit]
+Description=Local badminton booking account control page
+After=network.target
+
+[Service]
+Type=simple
+User=<YOUR_USERNAME>
+WorkingDirectory=/home/<YOUR_USERNAME>/badminton
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/<YOUR_USERNAME>/badminton/.venv/bin/python /home/<YOUR_USERNAME>/badminton/booking_admin.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
