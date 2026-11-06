@@ -24,6 +24,10 @@ Python Playwright automation for booking badminton courts on Southampton Sport G
 - `DRY_RUN=true` never clicks the final confirmation button
 - A transient stuck session is closed and re-created with a fresh login, with no
   more than three total session attempts per account
+- The full booking wave starts at midnight. At `08:00` and `16:00`, scheduled
+  retry waves skip account slots already confirmed for that target date and run
+  only the remaining enabled accounts. Earlier confirmations continue to guide
+  time continuity and exact-Court coordination during those retries
 
 The script does not bypass CAPTCHA, MFA, verification pages, forbidden pages, or rate limits.
 
@@ -272,13 +276,17 @@ Add:
 ```cron
 CRON_TZ=Europe/London
 59 23 * * * /usr/bin/flock -n /tmp/badminton-booking.lock /bin/bash -lc 'sleep 30; cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/book_badminton.py >> /home/<YOUR_USERNAME>/badminton/logs/cron-run.log 2>&1'
+0 8,16 * * * /usr/bin/flock -n /tmp/badminton-booking.lock /bin/bash -lc 'cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/book_badminton.py --retry-missing >> /home/<YOUR_USERNAME>/badminton/logs/cron-run.log 2>&1'
 0 10 * * * /usr/bin/flock -n /tmp/badminton-booking-report.lock /bin/bash -lc 'cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/booking_daily_report.py >> /home/<YOUR_USERNAME>/badminton/logs/booking-report.log 2>&1'
 * * * * * /usr/bin/flock -n /tmp/badminton-cancellation-reminder.lock /bin/bash -lc 'cd /home/<YOUR_USERNAME>/badminton && /home/<YOUR_USERNAME>/badminton/.venv/bin/python -u /home/<YOUR_USERNAME>/badminton/booking_cancellation_reminder.py >> /home/<YOUR_USERNAME>/badminton/logs/cancellation-reminder.log 2>&1'
 ```
 
 This starts every day at `23:59:30` London time, prewarms the three account sessions,
-and submits the searches at midnight. The separate report job sends the summary at
-`10:00` London time. Each job has its own lock to prevent overlapping runs.
+and submits the first searches at midnight. At `08:00` and `16:00`, the retry
+command reads durable confirmations from the local booking logs, skips successful
+account slots, and opens browsers only for account slots still missing a booking.
+The separate report job sends the summary at `10:00` London time. Each job has its
+own lock to prevent overlapping runs.
 
 To send a manual report test only to the single address in
 `BOOKING_EMAIL_TEST_TO`, run:
@@ -299,13 +307,17 @@ Templates are in `deploy/`.
 
 ```bash
 sed -i "s|<YOUR_USERNAME>|$USER|g" deploy/badminton-booking.service
+sed -i "s|<YOUR_USERNAME>|$USER|g" deploy/badminton-booking-retry.service
 sudo cp deploy/badminton-booking.service /etc/systemd/system/
 sudo cp deploy/badminton-booking.timer /etc/systemd/system/
+sudo cp deploy/badminton-booking-retry.service /etc/systemd/system/
+sudo cp deploy/badminton-booking-retry.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now badminton-booking.timer
+sudo systemctl enable --now badminton-booking.timer badminton-booking-retry.timer
 ```
 
-The timer runs every day at `00:00:00 Europe/London`.
+The primary timer runs every day at `00:00:00 Europe/London`; the retry timer runs
+at `08:00` and `16:00 Europe/London`.
 
 ## Logs
 

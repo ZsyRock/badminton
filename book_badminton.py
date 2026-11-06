@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
@@ -17,6 +18,8 @@ from dotenv import load_dotenv
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
+
+from booking_email import ConfirmedBooking, collect_confirmed_bookings
 
 DEFAULT_BOOKING_URL = "https://soton.gladstonego.cloud/account"
 DEFAULT_LOGIN_PATH = "/auth/login"
@@ -53,6 +56,11 @@ ACCOUNT_C_KEY = "account_c"
 ACCOUNT_A_LABEL = "账号A"
 ACCOUNT_B_LABEL = "账号B"
 ACCOUNT_C_LABEL = "账号C"
+ACCOUNT_KEYS_BY_LABEL = {
+    ACCOUNT_A_LABEL: ACCOUNT_A_KEY,
+    ACCOUNT_B_LABEL: ACCOUNT_B_KEY,
+    ACCOUNT_C_LABEL: ACCOUNT_C_KEY,
+}
 TARGET_BOOKING_TIMES = ("15:00", "16:00", "17:00", "18:00", "19:00")
 ACCOUNT_PRIMARY_TIMES = {
     ACCOUNT_A_KEY: "18:00",
@@ -3211,20 +3219,55 @@ async def run_account_booking(
         release_remaining_account_phases(coordinator, account.key)
 
 
-async def run_booking() -> int:
+def confirmed_bookings_for_target(
+    target_date: date,
+    *,
+    logs_dir: Path = LOGS_DIR,
+) -> tuple[ConfirmedBooking, ...]:
+    """Return the latest durable confirmations for one target date."""
+
+    return tuple(
+        booking
+        for booking in collect_confirmed_bookings(logs_dir)
+        if booking.booking_date == target_date
+    )
+
+
+def select_retry_accounts(
+    accounts: Sequence[BookingAccountConfig],
+    confirmed_bookings: Iterable[ConfirmedBooking],
+) -> tuple[BookingAccountConfig, ...]:
+    """Keep only account slots without a confirmed booking for the target date."""
+
+    confirmed_labels = {
+        booking.account_label for booking in confirmed_bookings
+    }
+    return tuple(
+        account for account in accounts if account.label not in confirmed_labels
+    )
+
+
+def seed_coordinator_with_confirmed_bookings(
+    coordinator: BookingCoordinator,
+    confirmed_bookings: Iterable[ConfirmedBooking],
+) -> None:
+    """Preserve earlier-round time and Court choices during a retry round."""
+
+    for booking in confirmed_bookings:
+        account_key = ACCOUNT_KEYS_BY_LABEL.get(booking.account_label)
+        if account_key is None:
+            continue
+        claim_slot_for_account(
+            coordinator,
+            account_key,
+            SlotPreference(booking.start_time, booking.court_number),
+        )
+
+
+async def run_booking(*, retry_missing: bool = False) -> int:
     config = load_config()
     logger, log_path = setup_logging(config.timezone_name)
     logger.info("Log file: %s", log_path)
-    logger.info(
-        "Configured booking accounts: %s",
-        ", ".join(account.label for account in config.accounts) or "none",
-    )
-    if not config.accounts:
-        logger.info(
-            "No booking accounts are enabled; exiting without opening a browser."
-        )
-        logger.info("Booking run completed; exit_code=0")
-        return 0
 
     browser = None
     run_now = datetime.now(timezone.utc)
@@ -3255,6 +3298,53 @@ async def run_booking() -> int:
         target_date=coordinator_target_date,
         release_at=release_at,
     )
+    earlier_confirmations: tuple[ConfirmedBooking, ...] = ()
+    if retry_missing:
+        earlier_confirmations = confirmed_bookings_for_target(
+            coordinator_target_date,
+        )
+        original_accounts = config.accounts
+        retry_accounts = select_retry_accounts(
+            original_accounts,
+            earlier_confirmations,
+        )
+        skipped_labels = [
+            account.label
+            for account in original_accounts
+            if account not in retry_accounts
+        ]
+        config = replace(config, accounts=retry_accounts)
+        logger.info(
+            "Scheduled retry mode is active for target date %s.",
+            format_date_for_site(coordinator_target_date),
+        )
+        logger.info(
+            "Already confirmed account slots skipped: %s",
+            ", ".join(skipped_labels) or "none",
+        )
+        seed_coordinator_with_confirmed_bookings(
+            coordinator,
+            earlier_confirmations,
+        )
+
+    logger.info(
+        "Configured booking accounts: %s",
+        ", ".join(account.label for account in config.accounts) or "none",
+    )
+    if not config.accounts:
+        if retry_missing and earlier_confirmations:
+            logger.info(
+                "Every enabled account slot already has a confirmed booking for %s; "
+                "the retry exits without opening a browser.",
+                format_date_for_site(coordinator_target_date),
+            )
+        else:
+            logger.info(
+                "No booking accounts require this run; exiting without opening a browser."
+            )
+        logger.info("Booking run completed; exit_code=0")
+        return 0
+
     exit_code = 1
     async with async_playwright() as playwright:
         try:
@@ -3281,8 +3371,24 @@ async def run_booking() -> int:
     return exit_code
 
 
-def main() -> int:
-    return asyncio.run(run_booking())
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Book preferred Southampton badminton slots",
+    )
+    parser.add_argument(
+        "--retry-missing",
+        action="store_true",
+        help=(
+            "skip account slots already confirmed for the target date and retry "
+            "only the remaining enabled accounts"
+        ),
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    return asyncio.run(run_booking(retry_missing=args.retry_missing))
 
 
 if __name__ == "__main__":

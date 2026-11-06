@@ -469,7 +469,7 @@ def render_page(
 </head>
 <body><main>
   <header><h1>Badminton Booking Control</h1>
-    <div class="notice"><p>The accounts currently logged in will participate in booking badminton slots eight days ahead shortly after midnight each day.</p><p class="urgent"><strong>If you cannot attend, please cancel at least four hours before the slot starts.</strong></p></div>
+    <div class="notice"><p>The accounts currently logged in will participate in booking badminton slots eight days ahead shortly after midnight each day. Accounts without a confirmed slot will retry at 08:00 and 16:00.</p><p class="urgent"><strong>If you cannot attend, please cancel at least four hours before the slot starts.</strong></p></div>
     <span class="summary">{enabled_count} active account{'s' if enabled_count != 1 else ''}</span>
   </header>
   {flash}

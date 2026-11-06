@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry missing badminton bookings at 08:00 and 16:00 Europe/London
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Europe/London
+OnCalendar=*-*-* 16:00:00 Europe/London
+AccuracySec=1s
+Persistent=true
+Unit=badminton-booking-retry.service
+
+[Install]
+WantedBy=timers.target

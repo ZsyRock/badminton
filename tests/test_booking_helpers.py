@@ -3137,3 +3137,100 @@ def test_diagnostic_failure_does_not_trigger_a_fresh_booking_session(monkeypatch
 
     assert exit_code == 0
     assert len(browser.contexts) == 1
+
+
+def test_retry_round_keeps_only_accounts_without_target_date_confirmation():
+    accounts = tuple(
+        make_retry_test_context(account_key)[1]
+        for account_key in (ACCOUNT_A_KEY, ACCOUNT_B_KEY, ACCOUNT_C_KEY)
+    )
+    target_date = date(2026, 11, 14)
+    confirmed = (
+        book_badminton.ConfirmedBooking(
+            target_date,
+            book_badminton.ACCOUNT_A_LABEL,
+            "18:00",
+            1,
+        ),
+        book_badminton.ConfirmedBooking(
+            target_date,
+            book_badminton.ACCOUNT_C_LABEL,
+            "17:00",
+            1,
+        ),
+    )
+
+    retry_accounts = book_badminton.select_retry_accounts(accounts, confirmed)
+
+    assert [account.key for account in retry_accounts] == [ACCOUNT_B_KEY]
+
+
+def test_retry_coordinator_preserves_earlier_round_slots():
+    target_date = date(2026, 11, 14)
+    coordinator = book_badminton.BookingCoordinator(target_date=target_date)
+    confirmed = (
+        book_badminton.ConfirmedBooking(
+            target_date,
+            book_badminton.ACCOUNT_A_LABEL,
+            "18:00",
+            1,
+        ),
+        book_badminton.ConfirmedBooking(
+            target_date,
+            book_badminton.ACCOUNT_C_LABEL,
+            "17:00",
+            1,
+        ),
+    )
+
+    book_badminton.seed_coordinator_with_confirmed_bookings(
+        coordinator,
+        confirmed,
+    )
+
+    assert book_badminton.get_coordinated_time_counts(coordinator) == {
+        "17:00": 1,
+        "18:00": 1,
+    }
+    assert not book_badminton.claim_slot_for_account(
+        coordinator,
+        ACCOUNT_B_KEY,
+        SlotPreference("18:00", 1),
+    )
+    assert book_badminton.claim_slot_for_account(
+        coordinator,
+        ACCOUNT_B_KEY,
+        SlotPreference("18:00", 2),
+    )
+
+
+def test_retry_confirmation_scan_uses_only_requested_target_date(tmp_path):
+    (tmp_path / "book-badminton-20261106-000001.log").write_text(
+        "\n".join(
+            (
+                "2026-11-06 00:00:01 | INFO | Configured booking accounts: 账号A, 账号B",
+                "2026-11-06 00:00:01 | INFO | [账号A] Target booking date is 14/11/2026",
+                "2026-11-06 00:00:05 | INFO | [账号A] Success: confirmed booking for 18:00 Jubilee Court 1",
+                "2026-11-06 00:00:01 | INFO | [账号B] Target booking date is 15/11/2026",
+                "2026-11-06 00:00:05 | INFO | [账号B] Success: confirmed booking for 18:00 Jubilee Court 2",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bookings = book_badminton.confirmed_bookings_for_target(
+        date(2026, 11, 14),
+        logs_dir=tmp_path,
+    )
+
+    assert [(booking.account_label, booking.start_time, booking.court_number) for booking in bookings] == [
+        (book_badminton.ACCOUNT_A_LABEL, "18:00", 1)
+    ]
+
+
+def test_retry_missing_command_line_flag_is_opt_in():
+    parser = book_badminton.build_argument_parser()
+
+    assert not parser.parse_args([]).retry_missing
+    assert parser.parse_args(["--retry-missing"]).retry_missing

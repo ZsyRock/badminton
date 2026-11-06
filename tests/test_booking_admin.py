@@ -108,6 +108,7 @@ def test_control_page_includes_cancellation_notice_and_schedule(monkeypatch):
     page = booking_admin.render_page({}, "csrf-token")
 
     assert "booking badminton slots eight days ahead" in page
+    assert "retry at 08:00 and 16:00" in page
     assert (
         "<strong>If you cannot attend, please cancel at least four hours "
         "before the slot starts.</strong>"
